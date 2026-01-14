@@ -48,3 +48,29 @@ For each detected trade:
 
 To keep continuity between machines, update `docs/HANDOFF.md` when you stop work.
 Start each new session by asking Codex to read it.
+
+## Sync To Another PC (GitHub)
+
+Use these steps on a second Windows PC to pick up the project:
+
+1) Install Git:
+```
+winget install --id Git.Git -e
+```
+
+2) Clone the repo (replace placeholders):
+```
+git clone https://github.com/<YOUR_USERNAME>/<YOUR_REPO>.git
+cd <YOUR_REPO>
+```
+
+3) Create local config:
+```
+Copy-Item config.example.json config.json
+```
+
+4) Edit `config.json` and run:
+```
+python -m pip install -r requirements.txt
+python bot.py
+```
