@@ -1,5 +1,5 @@
 {
-  "wallet": "YourWalletPublicKeyHere",
+  "wallets": ["WalletPublicKey1", "WalletPublicKey2"],
   "rpc_http": "https://api.mainnet-beta.solana.com",
   "rpc_ws": "wss://api.mainnet-beta.solana.com",
   "commitment": "confirmed",

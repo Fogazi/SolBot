@@ -11,7 +11,7 @@ Copy-Item config.example.json config.json
 ```
 
 2) Edit `config.json`:
-   - Add your wallet public key
+   - Add your wallet public key (use `wallet` for one or `wallets` for many)
    - Add your RPC HTTP + WSS endpoints
    - Add your Jupiter API key in `jupiter_headers`
 
@@ -30,6 +30,7 @@ python bot.py
 ## Output fields
 
 For each detected trade:
+- Wallet
 - Token Name
 - Ticker
 - CA (mint address)

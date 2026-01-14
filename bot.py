@@ -316,6 +316,7 @@ def summarize_trades(signature: str, slot: int, block_time: int, wallet: str, tx
         "signature": signature,
         "slot": slot,
         "block_time": block_time,
+        "wallet": wallet,
         "sol_change": sol_change,
         "trades": trades,
     }
@@ -333,6 +334,7 @@ def print_trade_summary(summary: dict):
     print("")
     print(f"[TX] {ts_str} | slot {summary['slot']}")
     print(f"signature: {summary['signature']}")
+    print(f"wallet: {summary['wallet']}")
     print(f"wallet sol delta: {sol_change:.9f} SOL")
 
     for trade in summary["trades"]:
@@ -360,8 +362,20 @@ def print_trade_summary(summary: dict):
             print(f"sol received: {sol_received:.9f} SOL")
 
 
+def normalize_wallets(config: dict) -> list[str]:
+    wallets = config.get("wallets")
+    if wallets is None:
+        wallet = config.get("wallet")
+        wallets = [wallet] if wallet else []
+    elif isinstance(wallets, str):
+        wallets = [wallets]
+    else:
+        wallets = [w for w in wallets if w]
+    return wallets
+
+
 async def listen_for_trades(config: dict):
-    wallet = config["wallet"]
+    wallets = normalize_wallets(config)
     ws_url = config["rpc_ws"]
     commitment = config.get("commitment", "confirmed")
     token_list_url = config.get("jupiter_tokens_url", JUPITER_TOKENS_URL_DEFAULT)
@@ -392,7 +406,7 @@ async def listen_for_trades(config: dict):
                     "id": 1,
                     "method": "logsSubscribe",
                     "params": [
-                        {"mentions": [wallet]},
+                        {"mentions": wallets},
                         {"commitment": commitment},
                     ],
                 }
@@ -418,30 +432,37 @@ async def listen_for_trades(config: dict):
                     tx = await fetch_transaction(rpc, signature, commitment)
                     if not tx:
                         continue
-                    summary = summarize_trades(
-                        signature=signature,
-                        slot=slot or 0,
-                        block_time=tx.get("blockTime", 0),
-                        wallet=wallet,
-                        tx=tx,
-                    )
-                    if not summary:
+                    summaries = []
+                    for wallet in wallets:
+                        summary = summarize_trades(
+                            signature=signature,
+                            slot=slot or 0,
+                            block_time=tx.get("blockTime", 0),
+                            wallet=wallet,
+                            tx=tx,
+                        )
+                        if summary:
+                            summaries.append(summary)
+                    if not summaries:
                         continue
 
-                    mints = list({trade["mint"] for trade in summary["trades"]})
+                    mints = list(
+                        {trade["mint"] for summary in summaries for trade in summary["trades"]}
+                    )
                     try:
                         await token_cache.ensure(mints)
                     except Exception as exc:
                         print(f"token metadata error: {exc}")
 
-                    for trade in summary["trades"]:
-                        mint = trade["mint"]
-                        meta = token_cache.get(mint) or {}
-                        trade["name"] = meta.get("name")
-                        trade["symbol"] = meta.get("symbol")
-                        trade["marketcap"] = meta.get("mcap")
+                    for summary in summaries:
+                        for trade in summary["trades"]:
+                            mint = trade["mint"]
+                            meta = token_cache.get(mint) or {}
+                            trade["name"] = meta.get("name")
+                            trade["symbol"] = meta.get("symbol")
+                            trade["marketcap"] = meta.get("mcap")
 
-                    print_trade_summary(summary)
+                        print_trade_summary(summary)
         except (websockets.WebSocketException, httpx.HTTPError, RuntimeError) as exc:
             print(f"connection error: {exc}. reconnecting in {backoff}s")
             await asyncio.sleep(backoff)
@@ -467,13 +488,17 @@ def main():
         print(f"Failed to load config: {exc}")
         sys.exit(1)
 
-    missing = [k for k in ("wallet", "rpc_http", "rpc_ws") if k not in config]
-    if missing:
-        print(f"Missing config keys: {', '.join(missing)}")
+    wallets = normalize_wallets(config)
+    missing = [k for k in ("rpc_http", "rpc_ws") if k not in config]
+    if missing or not wallets:
+        missing_keys = missing[:]
+        if not wallets:
+            missing_keys.append("wallet or wallets")
+        print(f"Missing config keys: {', '.join(missing_keys)}")
         sys.exit(1)
 
     print("Starting wallet trade detector...")
-    print(f"wallet: {config['wallet']}")
+    print(f"wallets: {', '.join(wallets)}")
     print(f"http: {config['rpc_http']}")
     print(f"ws: {config['rpc_ws']}")
 
