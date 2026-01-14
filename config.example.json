@@ -1,0 +1,11 @@
+{
+  "wallet": "YourWalletPublicKeyHere",
+  "rpc_http": "https://api.mainnet-beta.solana.com",
+  "rpc_ws": "wss://api.mainnet-beta.solana.com",
+  "commitment": "confirmed",
+  "jupiter_tokens_url": "https://api.jup.ag/ultra/v1/search?query={query}",
+  "jupiter_refresh_sec": 600,
+  "jupiter_headers": {
+    "x-api-key": "YOUR_JUPITER_API_KEY"
+  }
+}
