@@ -20,6 +20,11 @@ STABLE_MINTS = {
 
 JUPITER_TOKENS_URL_DEFAULT = "https://api.jup.ag/ultra/v1/search?query={query}"
 JUPITER_REFRESH_SEC_DEFAULT = 600
+PRICE_URL_DEFAULT = "https://api.jup.ag/price/v3?ids={ids}"
+PRICE_POLL_SEC_DEFAULT = 30
+ALERT_DROP_PCT_DEFAULT = Decimal("10")
+ALERT_RISE_PCT_DEFAULT = Decimal("20")
+PRICE_WATCH_PATH_DEFAULT = "price_watch.json"
 GREEN_CIRCLE = "\U0001F7E2"
 RED_CIRCLE = "\U0001F534"
 
@@ -77,6 +82,92 @@ def format_usd(value: Decimal) -> str:
     return f"{value.quantize(Decimal('0.01'), rounding=ROUND_HALF_UP):f}"
 
 
+def parse_decimal(value):
+    if value is None:
+        return None
+    try:
+        return Decimal(str(value))
+    except Exception:
+        return None
+
+
+def chunked(items, size: int):
+    for i in range(0, len(items), size):
+        yield items[i : i + size]
+
+
+def serialize_price_watch(price_watch: dict) -> dict:
+    entries = []
+    for (wallet, mint), entry in price_watch.items():
+        buy_price = entry.get("buy_price")
+        if buy_price is None:
+            continue
+        entries.append(
+            {
+                "wallet": wallet,
+                "mint": mint,
+                "buy_price": str(buy_price),
+                "alerted_down": bool(entry.get("alerted_down", False)),
+                "alerted_up": bool(entry.get("alerted_up", False)),
+                "name": entry.get("name"),
+                "symbol": entry.get("symbol"),
+            }
+        )
+    return {"version": 1, "entries": entries}
+
+
+def load_price_watch(path: Path, wallets: set[str]) -> dict:
+    if not path.exists():
+        return {}
+    try:
+        raw = json.loads(path.read_text(encoding="utf-8"))
+    except Exception as exc:
+        print(f"price watch load error: {exc}")
+        return {}
+
+    if isinstance(raw, dict):
+        entries = raw.get("entries", [])
+    elif isinstance(raw, list):
+        entries = raw
+    else:
+        return {}
+
+    price_watch = {}
+    for entry in entries:
+        if not isinstance(entry, dict):
+            continue
+        wallet = entry.get("wallet")
+        mint = entry.get("mint")
+        if not wallet or not mint:
+            continue
+        if wallets and wallet not in wallets:
+            continue
+        buy_price = parse_decimal(entry.get("buy_price"))
+        if buy_price is None or buy_price <= 0:
+            continue
+        price_watch[(wallet, mint)] = {
+            "buy_price": buy_price,
+            "alerted_down": bool(entry.get("alerted_down", False)),
+            "alerted_up": bool(entry.get("alerted_up", False)),
+            "name": entry.get("name"),
+            "symbol": entry.get("symbol"),
+        }
+    return price_watch
+
+
+def save_price_watch(path: Path, price_watch: dict):
+    payload = serialize_price_watch(price_watch)
+    try:
+        if path.parent and not path.parent.exists():
+            path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(
+            json.dumps(payload, indent=2, ensure_ascii=True),
+            encoding="utf-8",
+        )
+    except Exception as exc:
+        print(f"price watch save error: {exc}")
+
+
 def sol_delta(meta: dict, message: dict, wallet: str) -> Decimal:
     keys = message.get("accountKeys", [])
     wallet_index = None
@@ -89,6 +180,21 @@ def sol_delta(meta: dict, message: dict, wallet: str) -> Decimal:
     pre = meta.get("preBalances", [])[wallet_index]
     post = meta.get("postBalances", [])[wallet_index]
     return Decimal(post - pre) / Decimal(1_000_000_000)
+
+
+def sol_balance(meta: dict, message: dict, wallet: str):
+    keys = message.get("accountKeys", [])
+    wallet_index = None
+    for i, k in enumerate(keys):
+        if key_str(k) == wallet:
+            wallet_index = i
+            break
+    if wallet_index is None:
+        return None
+    post_balances = meta.get("postBalances", [])
+    if wallet_index >= len(post_balances):
+        return None
+    return Decimal(post_balances[wallet_index]) / Decimal(1_000_000_000)
 
 
 class RpcClient:
@@ -264,6 +370,43 @@ class JupiterTokenCache:
         await self.client.aclose()
 
 
+class JupiterPriceClient:
+    def __init__(self, url: str, headers: dict, timeout_sec: int = 20):
+        self.url = url
+        self.headers = headers
+        self.client = httpx.AsyncClient(timeout=timeout_sec)
+
+    def _build_url(self, ids: list[str]):
+        joined = ",".join(ids)
+        if "{ids}" in self.url:
+            return self.url.format(ids=joined)
+        if "?" in self.url:
+            return f"{self.url}&ids={joined}"
+        return f"{self.url}?ids={joined}"
+
+    async def fetch_prices(self, ids: list[str]) -> dict:
+        if not ids:
+            return {}
+        result = {}
+        for batch in chunked(ids, 50):
+            url = self._build_url(batch)
+            resp = await self.client.get(url, headers=self.headers)
+            resp.raise_for_status()
+            payload = resp.json()
+            if not isinstance(payload, dict):
+                continue
+            for mint, info in payload.items():
+                if not isinstance(info, dict):
+                    continue
+                price = parse_decimal(info.get("usdPrice"))
+                if price is not None:
+                    result[mint] = price
+        return result
+
+    async def close(self):
+        await self.client.aclose()
+
+
 async def fetch_transaction(rpc: RpcClient, signature: str, commitment: str, retries: int = 3):
     for attempt in range(retries):
         result = await rpc.call(
@@ -294,6 +437,7 @@ def summarize_trades(signature: str, slot: int, block_time: int, wallet: str, tx
         return None
 
     sol_change = sol_delta(meta, message, wallet)
+    sol_post = sol_balance(meta, message, wallet)
     trades = []
 
     for mint, delta_raw, decimals in token_deltas:
@@ -318,6 +462,7 @@ def summarize_trades(signature: str, slot: int, block_time: int, wallet: str, tx
         "block_time": block_time,
         "wallet": wallet,
         "sol_change": sol_change,
+        "sol_balance": sol_post,
         "trades": trades,
     }
 
@@ -336,6 +481,9 @@ def print_trade_summary(summary: dict):
     print(f"signature: {summary['signature']}")
     print(f"wallet: {summary['wallet']}")
     print(f"wallet sol delta: {sol_change:.9f} SOL")
+    sol_balance_post = summary.get("sol_balance")
+    if sol_balance_post is not None:
+        print(f"wallet sol balance: {sol_balance_post:.9f} SOL")
 
     for trade in summary["trades"]:
         side = trade["side"]
@@ -362,6 +510,95 @@ def print_trade_summary(summary: dict):
             print(f"sol received: {sol_received:.9f} SOL")
 
 
+async def run_price_alerts(
+    price_client,
+    price_watch: dict,
+    price_lock: asyncio.Lock,
+    price_watch_path: Path,
+    drop_pct: Decimal,
+    rise_pct: Decimal,
+    poll_sec: int,
+):
+    if poll_sec <= 0:
+        return
+    drop_threshold = (drop_pct * Decimal(100)).quantize(
+        Decimal("0.01"), rounding=ROUND_HALF_UP
+    )
+    rise_threshold = (rise_pct * Decimal(100)).quantize(
+        Decimal("0.01"), rounding=ROUND_HALF_UP
+    )
+    while True:
+        try:
+            await asyncio.sleep(poll_sec)
+            async with price_lock:
+                watch_snapshot = {
+                    key: {
+                        "buy_price": entry.get("buy_price"),
+                        "alerted_down": entry.get("alerted_down", False),
+                        "alerted_up": entry.get("alerted_up", False),
+                        "name": entry.get("name"),
+                        "symbol": entry.get("symbol"),
+                    }
+                    for key, entry in price_watch.items()
+                }
+            if not watch_snapshot:
+                continue
+
+            mints = sorted({mint for (_, mint) in watch_snapshot.keys()})
+            prices = await price_client.fetch_prices(mints)
+            if not prices:
+                continue
+
+            alerts = []
+            updates = []
+            for (wallet, mint), entry in watch_snapshot.items():
+                price = prices.get(mint)
+                if price is None:
+                    continue
+                buy_price = entry.get("buy_price")
+                if buy_price is None or buy_price <= 0:
+                    continue
+                change = (price - buy_price) / buy_price
+                if change <= -drop_pct and not entry.get("alerted_down"):
+                    alerts.append(("DROP", wallet, mint, entry, price, change))
+                    updates.append((wallet, mint, "alerted_down", buy_price))
+                if change >= rise_pct and not entry.get("alerted_up"):
+                    alerts.append(("RISE", wallet, mint, entry, price, change))
+                    updates.append((wallet, mint, "alerted_up", buy_price))
+
+            if updates:
+                async with price_lock:
+                    for wallet, mint, flag, buy_price in updates:
+                        entry = price_watch.get((wallet, mint))
+                        if entry and entry.get("buy_price") == buy_price:
+                            entry[flag] = True
+                    save_price_watch(price_watch_path, price_watch)
+
+            if alerts:
+                ts_str = time.strftime("%Y-%m-%d %H:%M:%S", time.gmtime())
+                for kind, wallet, mint, entry, price, change in alerts:
+                    change_pct = (change * Decimal(100)).quantize(
+                        Decimal("0.01"), rounding=ROUND_HALF_UP
+                    )
+                    name = entry.get("name") or "unknown"
+                    symbol = entry.get("symbol") or "unknown"
+                    target = drop_threshold if kind == "DROP" else rise_threshold
+                    print("")
+                    print(f"[ALERT] {ts_str} | {kind}")
+                    print(f"wallet: {wallet}")
+                    print(f"token: {name}")
+                    print(f"ticker: {symbol}")
+                    print(f"CA: {mint}")
+                    print(f"buy price: {format_usd(buy_price)} USD")
+                    print(f"current price: {format_usd(price)} USD")
+                    print(f"change: {change_pct}% (threshold {target}%)")
+        except asyncio.CancelledError:
+            break
+        except Exception as exc:
+            print(f"price alert error: {exc}")
+            await asyncio.sleep(min(poll_sec, 30))
+
+
 def normalize_wallets(config: dict) -> list[str]:
     wallets = config.get("wallets")
     if wallets is None:
@@ -374,19 +611,64 @@ def normalize_wallets(config: dict) -> list[str]:
     return wallets
 
 
+async def subscribe_wallets(ws, wallets: list[str], commitment: str):
+    wallet_by_sub_id = {}
+    pending = []
+    request_id = 1
+
+    for wallet in wallets:
+        sub_msg = {
+            "jsonrpc": "2.0",
+            "id": request_id,
+            "method": "logsSubscribe",
+            "params": [
+                {"mentions": [wallet]},
+                {"commitment": commitment},
+            ],
+        }
+        await ws.send(json.dumps(sub_msg))
+        while True:
+            raw = await ws.recv()
+            msg = json.loads(raw)
+            if msg.get("id") == request_id:
+                if "error" in msg:
+                    raise RuntimeError(msg["error"])
+                sub_id = msg.get("result")
+                if sub_id is not None:
+                    wallet_by_sub_id[sub_id] = wallet
+                break
+            pending.append(msg)
+        request_id += 1
+
+    return wallet_by_sub_id, pending
+
+
 async def listen_for_trades(config: dict):
     wallets = normalize_wallets(config)
     ws_url = config["rpc_ws"]
     commitment = config.get("commitment", "confirmed")
     token_list_url = config.get("jupiter_tokens_url", JUPITER_TOKENS_URL_DEFAULT)
+    price_url = config.get("price_url", PRICE_URL_DEFAULT)
+    price_watch_path = Path(config.get("price_watch_path", PRICE_WATCH_PATH_DEFAULT))
     refresh_sec = int(config.get("jupiter_refresh_sec", JUPITER_REFRESH_SEC_DEFAULT))
+    price_poll_sec = int(config.get("price_poll_sec", PRICE_POLL_SEC_DEFAULT))
+    drop_pct = parse_decimal(config.get("alert_drop_pct", ALERT_DROP_PCT_DEFAULT))
+    rise_pct = parse_decimal(config.get("alert_rise_pct", ALERT_RISE_PCT_DEFAULT))
+    drop_ratio = (drop_pct or ALERT_DROP_PCT_DEFAULT) / Decimal(100)
+    rise_ratio = (rise_pct or ALERT_RISE_PCT_DEFAULT) / Decimal(100)
     headers = config.get("jupiter_headers") or {}
     if not isinstance(headers, dict):
         headers = {}
 
     rpc = RpcClient(config["rpc_http"])
     token_cache = JupiterTokenCache(token_list_url, refresh_sec, headers)
+    price_client = JupiterPriceClient(price_url, headers)
+    price_watch = load_price_watch(price_watch_path, set(wallets))
+    price_lock = asyncio.Lock()
     seen = deque(maxlen=2000)
+
+    if price_watch:
+        print(f"loaded {len(price_watch)} price watch entries")
 
     try:
         await token_cache.refresh()
@@ -397,26 +679,31 @@ async def listen_for_trades(config: dict):
     if token_cache.mode == "list":
         refresh_task = asyncio.create_task(token_cache.run())
 
+    price_task = None
+    if price_poll_sec > 0:
+        price_task = asyncio.create_task(
+            run_price_alerts(
+                price_client,
+                price_watch,
+                price_lock,
+                price_watch_path,
+                drop_ratio,
+                rise_ratio,
+                price_poll_sec,
+            )
+        )
+
     backoff = 1
     while True:
         try:
             async with websockets.connect(ws_url, ping_interval=20, ping_timeout=20) as ws:
-                sub_msg = {
-                    "jsonrpc": "2.0",
-                    "id": 1,
-                    "method": "logsSubscribe",
-                    "params": [
-                        {"mentions": wallets},
-                        {"commitment": commitment},
-                    ],
-                }
-                await ws.send(json.dumps(sub_msg))
-                await ws.recv()
+                wallet_by_sub_id, pending = await subscribe_wallets(ws, wallets, commitment)
 
                 backoff = 1
-                async for raw in ws:
-                    msg = json.loads(raw)
-                    params = msg.get("params", {})
+                async def handle_message(msg: dict):
+                    params = msg.get("params")
+                    if not isinstance(params, dict):
+                        return
                     result = params.get("result", {})
                     value = result.get("value", {})
 
@@ -424,16 +711,26 @@ async def listen_for_trades(config: dict):
                     err = value.get("err")
                     slot = result.get("context", {}).get("slot")
                     if err is not None or not signature:
-                        continue
-                    if signature in seen:
-                        continue
-                    seen.append(signature)
+                        return
+
+                    sub_id = params.get("subscription")
+                    wallet_hint = wallet_by_sub_id.get(sub_id)
+                    wallets_to_check = [wallet_hint] if wallet_hint else wallets
+                    pending_wallets = [
+                        wallet
+                        for wallet in wallets_to_check
+                        if (signature, wallet) not in seen
+                    ]
+                    if not pending_wallets:
+                        return
 
                     tx = await fetch_transaction(rpc, signature, commitment)
                     if not tx:
-                        continue
+                        return
+
                     summaries = []
-                    for wallet in wallets:
+                    for wallet in pending_wallets:
+                        seen.append((signature, wallet))
                         summary = summarize_trades(
                             signature=signature,
                             slot=slot or 0,
@@ -444,7 +741,7 @@ async def listen_for_trades(config: dict):
                         if summary:
                             summaries.append(summary)
                     if not summaries:
-                        continue
+                        return
 
                     mints = list(
                         {trade["mint"] for summary in summaries for trade in summary["trades"]}
@@ -462,7 +759,54 @@ async def listen_for_trades(config: dict):
                             trade["symbol"] = meta.get("symbol")
                             trade["marketcap"] = meta.get("mcap")
 
+                    sell_keys = []
+                    for summary in summaries:
+                        for trade in summary["trades"]:
+                            if trade["side"] == "SELL":
+                                sell_keys.append((summary["wallet"], trade["mint"]))
+                    if sell_keys:
+                        async with price_lock:
+                            for key in sell_keys:
+                                price_watch.pop(key, None)
+                            save_price_watch(price_watch_path, price_watch)
+
+                    buy_requests = []
+                    for summary in summaries:
+                        for trade in summary["trades"]:
+                            if trade["side"] == "BUY":
+                                buy_requests.append((summary["wallet"], trade))
+                    if buy_requests:
+                        buy_mints = sorted({trade["mint"] for _, trade in buy_requests})
+                        try:
+                            prices = await price_client.fetch_prices(buy_mints)
+                        except Exception as exc:
+                            print(f"price fetch error: {exc}")
+                            prices = {}
+                        if prices:
+                            async with price_lock:
+                                for wallet, trade in buy_requests:
+                                    mint = trade["mint"]
+                                    price = prices.get(mint)
+                                    if price is None:
+                                        continue
+                                    price_watch[(wallet, mint)] = {
+                                        "buy_price": price,
+                                        "alerted_down": False,
+                                        "alerted_up": False,
+                                        "name": trade.get("name"),
+                                        "symbol": trade.get("symbol"),
+                                    }
+                                save_price_watch(price_watch_path, price_watch)
+
+                    for summary in summaries:
                         print_trade_summary(summary)
+
+                for msg in pending:
+                    await handle_message(msg)
+
+                async for raw in ws:
+                    msg = json.loads(raw)
+                    await handle_message(msg)
         except (websockets.WebSocketException, httpx.HTTPError, RuntimeError) as exc:
             print(f"connection error: {exc}. reconnecting in {backoff}s")
             await asyncio.sleep(backoff)
@@ -476,7 +820,10 @@ async def listen_for_trades(config: dict):
 
     if refresh_task:
         refresh_task.cancel()
+    if price_task:
+        price_task.cancel()
     await token_cache.close()
+    await price_client.close()
     await rpc.close()
 
 

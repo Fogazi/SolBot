@@ -6,10 +6,10 @@
   "jupiter_refresh_sec": 600,
   "jupiter_tokens_url": "https://api.jup.ag/ultra/v1/search?query={query}",
   "price_url": "https://api.jup.ag/price/v3?ids={ids}",
-  "price_poll_sec": 30,
-  "price_watch_path": "price_watch.json",
+  "price_poll_sec": 2,
   "alert_drop_pct": 10,
   "alert_rise_pct": 20,
+  "price_watch_path": "price_watch.json",
   "jupiter_headers": {
     "x-api-key": "9c3c8634-e826-45d6-98e7-cd8ab954b95d"
   }

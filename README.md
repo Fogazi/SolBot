@@ -37,6 +37,7 @@ For each detected trade:
 - Marketcap (USD)
 - Quantity bought/sold
 - SOL used (buy) or SOL received (sell)
+- Wallet SOL balance (post-transaction)
 
 ## Notes
 
@@ -44,6 +45,19 @@ For each detected trade:
 - SOL used/received is the wallet's net SOL delta for the transaction (fees included).
 - Jupiter Ultra endpoints can change; if needed, update `jupiter_tokens_url` in `config.json`.
 - `jupiter_tokens_url` supports list URLs or dynamic URLs that include `{ids}`, `{mint}`, or `{query}`.
+
+## Price Alerts
+
+When a BUY is detected, the bot records the current Jupiter Price API (USD) and
+alerts if the price drops 10% or rises 20% from that buy price.
+The watch list is persisted to `price_watch.json` by default.
+
+Config options:
+- `price_url`: Price API endpoint (default `https://api.jup.ag/price/v3?ids={ids}`)
+- `price_poll_sec`: Polling interval in seconds
+- `price_watch_path`: File path for persisting buy prices and alert state
+- `alert_drop_pct`: Percent drop threshold (default 10)
+- `alert_rise_pct`: Percent rise threshold (default 20)
 
 ## Project Handoff
 
