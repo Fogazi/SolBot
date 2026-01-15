@@ -24,6 +24,8 @@ PRICE_URL_DEFAULT = "https://api.jup.ag/price/v3?ids={ids}"
 PRICE_POLL_SEC_DEFAULT = 30
 ALERT_DROP_PCT_DEFAULT = Decimal("10")
 ALERT_RISE_PCT_DEFAULT = Decimal("20")
+TRAILING_START_PCT_DEFAULT = Decimal("20")
+TRAILING_DRAWDOWN_PCT_DEFAULT = Decimal("10")
 PRICE_WATCH_PATH_DEFAULT = "price_watch.json"
 GREEN_CIRCLE = "\U0001F7E2"
 RED_CIRCLE = "\U0001F534"
@@ -109,6 +111,12 @@ def serialize_price_watch(price_watch: dict) -> dict:
                 "buy_price": str(buy_price),
                 "alerted_down": bool(entry.get("alerted_down", False)),
                 "alerted_up": bool(entry.get("alerted_up", False)),
+                "trailing_active": bool(entry.get("trailing_active", False)),
+                "trailing_peak": (
+                    str(entry.get("trailing_peak"))
+                    if entry.get("trailing_peak") is not None
+                    else None
+                ),
                 "name": entry.get("name"),
                 "symbol": entry.get("symbol"),
             }
@@ -149,9 +157,15 @@ def load_price_watch(path: Path, wallets: set[str]) -> dict:
             "buy_price": buy_price,
             "alerted_down": bool(entry.get("alerted_down", False)),
             "alerted_up": bool(entry.get("alerted_up", False)),
+            "trailing_active": bool(entry.get("trailing_active", False)),
+            "trailing_peak": parse_decimal(entry.get("trailing_peak")),
             "name": entry.get("name"),
             "symbol": entry.get("symbol"),
         }
+        if price_watch[(wallet, mint)]["trailing_active"] and price_watch[(wallet, mint)][
+            "trailing_peak"
+        ] is None:
+            price_watch[(wallet, mint)]["trailing_peak"] = buy_price
     return price_watch
 
 
@@ -518,6 +532,8 @@ async def run_price_alerts(
     drop_pct: Decimal,
     rise_pct: Decimal,
     poll_sec: int,
+    trailing_start_pct: Decimal,
+    trailing_drawdown_pct: Decimal,
 ):
     if poll_sec <= 0:
         return
@@ -525,6 +541,12 @@ async def run_price_alerts(
         Decimal("0.01"), rounding=ROUND_HALF_UP
     )
     rise_threshold = (rise_pct * Decimal(100)).quantize(
+        Decimal("0.01"), rounding=ROUND_HALF_UP
+    )
+    trailing_start_threshold = (trailing_start_pct * Decimal(100)).quantize(
+        Decimal("0.01"), rounding=ROUND_HALF_UP
+    )
+    trailing_drawdown_threshold = (trailing_drawdown_pct * Decimal(100)).quantize(
         Decimal("0.01"), rounding=ROUND_HALF_UP
     )
     while True:
@@ -536,6 +558,8 @@ async def run_price_alerts(
                         "buy_price": entry.get("buy_price"),
                         "alerted_down": entry.get("alerted_down", False),
                         "alerted_up": entry.get("alerted_up", False),
+                        "trailing_active": entry.get("trailing_active", False),
+                        "trailing_peak": entry.get("trailing_peak"),
                         "name": entry.get("name"),
                         "symbol": entry.get("symbol"),
                     }
@@ -550,7 +574,8 @@ async def run_price_alerts(
                 continue
 
             alerts = []
-            updates = []
+            pending_updates = {}
+            pending_removals = {}
             for (wallet, mint), entry in watch_snapshot.items():
                 price = prices.get(mint)
                 if price is None:
@@ -559,39 +584,162 @@ async def run_price_alerts(
                 if buy_price is None or buy_price <= 0:
                     continue
                 change = (price - buy_price) / buy_price
-                if change <= -drop_pct and not entry.get("alerted_down"):
-                    alerts.append(("DROP", wallet, mint, entry, price, change))
-                    updates.append((wallet, mint, "alerted_down", buy_price))
-                if change >= rise_pct and not entry.get("alerted_up"):
-                    alerts.append(("RISE", wallet, mint, entry, price, change))
-                    updates.append((wallet, mint, "alerted_up", buy_price))
+                key = (wallet, mint)
 
-            if updates:
+                if trailing_start_pct > 0 and trailing_drawdown_pct > 0:
+                    trailing_active = bool(entry.get("trailing_active", False))
+                    trailing_peak = entry.get("trailing_peak")
+                    if trailing_peak is None and trailing_active:
+                        trailing_peak = buy_price
+
+                    if not trailing_active and change >= trailing_start_pct:
+                        trailing_active = True
+                        trailing_peak = price
+                        alerts.append(
+                            {
+                                "type": "TRAILING_ARMED",
+                                "wallet": wallet,
+                                "mint": mint,
+                                "entry": entry,
+                                "price": price,
+                                "buy_price": buy_price,
+                            }
+                        )
+                        pending_updates.setdefault(key, {"buy_price": buy_price, "changes": {}})[
+                            "changes"
+                        ].update(
+                            {
+                                "trailing_active": True,
+                                "trailing_peak": price,
+                            }
+                        )
+
+                    if trailing_active:
+                        if trailing_peak is None:
+                            trailing_peak = price
+                            pending_updates.setdefault(
+                                key, {"buy_price": buy_price, "changes": {}}
+                            )["changes"]["trailing_peak"] = price
+                        elif price > trailing_peak:
+                            trailing_peak = price
+                            pending_updates.setdefault(
+                                key, {"buy_price": buy_price, "changes": {}}
+                            )["changes"]["trailing_peak"] = price
+
+                        stop_price = trailing_peak * (Decimal(1) - trailing_drawdown_pct)
+                        if price <= stop_price:
+                            alerts.append(
+                                {
+                                    "type": "TRAILING_TP",
+                                    "wallet": wallet,
+                                    "mint": mint,
+                                    "entry": entry,
+                                    "price": price,
+                                    "buy_price": buy_price,
+                                    "peak_price": trailing_peak,
+                                    "stop_price": stop_price,
+                                }
+                            )
+                            pending_removals[key] = buy_price
+                            pending_updates.pop(key, None)
+                            continue
+
+                if change <= -drop_pct and not entry.get("alerted_down"):
+                    alerts.append(
+                        {
+                            "type": "DROP",
+                            "wallet": wallet,
+                            "mint": mint,
+                            "entry": entry,
+                            "price": price,
+                            "buy_price": buy_price,
+                            "change": change,
+                        }
+                    )
+                    pending_updates.setdefault(key, {"buy_price": buy_price, "changes": {}})[
+                        "changes"
+                    ]["alerted_down"] = True
+                if change >= rise_pct and not entry.get("alerted_up"):
+                    alerts.append(
+                        {
+                            "type": "RISE",
+                            "wallet": wallet,
+                            "mint": mint,
+                            "entry": entry,
+                            "price": price,
+                            "buy_price": buy_price,
+                            "change": change,
+                        }
+                    )
+                    pending_updates.setdefault(key, {"buy_price": buy_price, "changes": {}})[
+                        "changes"
+                    ]["alerted_up"] = True
+
+            if pending_updates or pending_removals:
                 async with price_lock:
-                    for wallet, mint, flag, buy_price in updates:
+                    for (wallet, mint), payload in pending_updates.items():
+                        entry = price_watch.get((wallet, mint))
+                        if not entry:
+                            continue
+                        if entry.get("buy_price") != payload["buy_price"]:
+                            continue
+                        entry.update(payload["changes"])
+                    for (wallet, mint), buy_price in pending_removals.items():
                         entry = price_watch.get((wallet, mint))
                         if entry and entry.get("buy_price") == buy_price:
-                            entry[flag] = True
+                            price_watch.pop((wallet, mint), None)
                     save_price_watch(price_watch_path, price_watch)
 
             if alerts:
                 ts_str = time.strftime("%Y-%m-%d %H:%M:%S", time.gmtime())
-                for kind, wallet, mint, entry, price, change in alerts:
-                    change_pct = (change * Decimal(100)).quantize(
-                        Decimal("0.01"), rounding=ROUND_HALF_UP
-                    )
+                for alert in alerts:
+                    kind = alert["type"]
+                    wallet = alert["wallet"]
+                    mint = alert["mint"]
+                    entry = alert["entry"]
+                    price = alert["price"]
+                    buy_price = alert["buy_price"]
                     name = entry.get("name") or "unknown"
                     symbol = entry.get("symbol") or "unknown"
-                    target = drop_threshold if kind == "DROP" else rise_threshold
                     print("")
-                    print(f"[ALERT] {ts_str} | {kind}")
-                    print(f"wallet: {wallet}")
-                    print(f"token: {name}")
-                    print(f"ticker: {symbol}")
-                    print(f"CA: {mint}")
-                    print(f"buy price: {format_usd(buy_price)} USD")
-                    print(f"current price: {format_usd(price)} USD")
-                    print(f"change: {change_pct}% (threshold {target}%)")
+                    if kind in ("DROP", "RISE"):
+                        change_pct = (alert["change"] * Decimal(100)).quantize(
+                            Decimal("0.01"), rounding=ROUND_HALF_UP
+                        )
+                        target = drop_threshold if kind == "DROP" else rise_threshold
+                        print(f"[ALERT] {ts_str} | {kind}")
+                        print(f"wallet: {wallet}")
+                        print(f"token: {name}")
+                        print(f"ticker: {symbol}")
+                        print(f"CA: {mint}")
+                        print(f"buy price: {format_usd(buy_price)} USD")
+                        print(f"current price: {format_usd(price)} USD")
+                        print(f"change: {change_pct}% (threshold {target}%)")
+                    elif kind == "TRAILING_ARMED":
+                        print(f"[ALERT] {ts_str} | TRAILING TP ARMED")
+                        print(f"wallet: {wallet}")
+                        print(f"token: {name}")
+                        print(f"ticker: {symbol}")
+                        print(f"CA: {mint}")
+                        print(f"buy price: {format_usd(buy_price)} USD")
+                        print(f"current price: {format_usd(price)} USD")
+                        print(
+                            f"trail start: {trailing_start_threshold}% "
+                            f"(drawdown {trailing_drawdown_threshold}%)"
+                        )
+                    elif kind == "TRAILING_TP":
+                        peak_price = alert["peak_price"]
+                        stop_price = alert["stop_price"]
+                        print(f"[ALERT] {ts_str} | TRAILING TP SELL")
+                        print(f"wallet: {wallet}")
+                        print(f"token: {name}")
+                        print(f"ticker: {symbol}")
+                        print(f"CA: {mint}")
+                        print(f"buy price: {format_usd(buy_price)} USD")
+                        print(f"peak price: {format_usd(peak_price)} USD")
+                        print(f"stop price: {format_usd(stop_price)} USD")
+                        print(f"current price: {format_usd(price)} USD")
+                        print(f"drawdown: {trailing_drawdown_threshold}%")
         except asyncio.CancelledError:
             break
         except Exception as exc:
@@ -654,8 +802,23 @@ async def listen_for_trades(config: dict):
     price_poll_sec = int(config.get("price_poll_sec", PRICE_POLL_SEC_DEFAULT))
     drop_pct = parse_decimal(config.get("alert_drop_pct", ALERT_DROP_PCT_DEFAULT))
     rise_pct = parse_decimal(config.get("alert_rise_pct", ALERT_RISE_PCT_DEFAULT))
+    trailing_start_pct = parse_decimal(
+        config.get("trailing_start_pct", TRAILING_START_PCT_DEFAULT)
+    )
+    trailing_drawdown_pct = parse_decimal(
+        config.get("trailing_drawdown_pct", TRAILING_DRAWDOWN_PCT_DEFAULT)
+    )
     drop_ratio = (drop_pct or ALERT_DROP_PCT_DEFAULT) / Decimal(100)
     rise_ratio = (rise_pct or ALERT_RISE_PCT_DEFAULT) / Decimal(100)
+    trailing_start_ratio = (
+        (trailing_start_pct or TRAILING_START_PCT_DEFAULT) / Decimal(100)
+    )
+    trailing_drawdown_ratio = (
+        (trailing_drawdown_pct or TRAILING_DRAWDOWN_PCT_DEFAULT) / Decimal(100)
+    )
+    if trailing_start_ratio <= 0 or trailing_drawdown_ratio <= 0:
+        trailing_start_ratio = Decimal(0)
+        trailing_drawdown_ratio = Decimal(0)
     headers = config.get("jupiter_headers") or {}
     if not isinstance(headers, dict):
         headers = {}
@@ -690,6 +853,8 @@ async def listen_for_trades(config: dict):
                 drop_ratio,
                 rise_ratio,
                 price_poll_sec,
+                trailing_start_ratio,
+                trailing_drawdown_ratio,
             )
         )
 
@@ -793,6 +958,8 @@ async def listen_for_trades(config: dict):
                                         "buy_price": price,
                                         "alerted_down": False,
                                         "alerted_up": False,
+                                        "trailing_active": False,
+                                        "trailing_peak": None,
                                         "name": trade.get("name"),
                                         "symbol": trade.get("symbol"),
                                     }

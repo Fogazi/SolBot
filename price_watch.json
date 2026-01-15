@@ -1,0 +1,16 @@
+{
+  "version": 1,
+  "entries": [
+    {
+      "wallet": "BM16WbBV5vWsqW7WC4nXEUm1yLaiM1Hia2f4jB9a8ZWr",
+      "mint": "FYh9r4zM46kPdQVavzsuybws3V6JL1DZgcfe6wPBAGS",
+      "buy_price": "0.000011058297979382578",
+      "alerted_down": false,
+      "alerted_up": true,
+      "trailing_active": false,
+      "trailing_peak": null,
+      "name": "JEETS CAN FLY",
+      "symbol": "FLYJEET"
+    }
+  ]
+}

@@ -51,6 +51,8 @@ For each detected trade:
 When a BUY is detected, the bot records the current Jupiter Price API (USD) and
 alerts if the price drops 10% or rises 20% from that buy price.
 The watch list is persisted to `price_watch.json` by default.
+Trailing TP alerts can be enabled to arm at +20% and trigger on a 10% drawdown
+from the peak.
 
 Config options:
 - `price_url`: Price API endpoint (default `https://api.jup.ag/price/v3?ids={ids}`)
@@ -58,6 +60,8 @@ Config options:
 - `price_watch_path`: File path for persisting buy prices and alert state
 - `alert_drop_pct`: Percent drop threshold (default 10)
 - `alert_rise_pct`: Percent rise threshold (default 20)
+- `trailing_start_pct`: Percent gain to arm the trailing TP (default 20)
+- `trailing_drawdown_pct`: Percent drawdown from peak to trigger (default 10)
 
 ## Project Handoff
 
