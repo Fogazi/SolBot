@@ -12,6 +12,7 @@
   "alert_rise_pct": 20,
   "trailing_start_pct": 20,
   "trailing_drawdown_pct": 10,
+  "trailing_status_sec": 5,
   "jupiter_headers": {
     "x-api-key": "9c3c8634-e826-45d6-98e7-cd8ab954b95d"
   }
