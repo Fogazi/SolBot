@@ -1,11 +1,16 @@
 {
-  "wallets": ["jt2ASTSu7Wxw4YEbac67AX5JeWsw12LJkyfviNbu11x","BM16WbBV5vWsqW7WC4nXEUm1yLaiM1Hia2f4jB9a8ZWr"],
+  "wallets": [
+    "8BfDa8gQ8qv1x2r4p5Z6u7y8a9b0cD1e2f3G4h5J6k7",
+    "H3kL9mN2pQ4rS6tU8vW1xY3zA5bC7dE9fG1hJ3kL5mN",
+	"BM16WbBV5vWsqW7WC4nXEUm1yLaiM1Hia2f4jB9a8ZWr"
+  ],
   "rpc_http": "https://solana-mainnet.core.chainstack.com/3bf3dd4cdc8ad586a34ea105adbad9a2",
   "rpc_ws": "wss://solana-mainnet.core.chainstack.com/3bf3dd4cdc8ad586a34ea105adbad9a2",
   "commitment": "confirmed",
   "jupiter_refresh_sec": 600,
   "jupiter_tokens_url": "https://api.jup.ag/ultra/v1/search?query={query}",
   "price_url": "https://api.jup.ag/price/v3?ids={ids}",
+  "swap_url": "https://api.jup.ag/ultra/v1",
   "price_poll_sec": 30,
   "price_watch_path": "price_watch.json",
   "alert_drop_pct": 10,
@@ -13,7 +18,21 @@
   "trailing_start_pct": 20,
   "trailing_drawdown_pct": 10,
   "trailing_status_sec": 5,
-  "jupiter_headers": {
-    "x-api-key": "9c3c8634-e826-45d6-98e7-cd8ab954b95d"
-  }
+  "auto_sell_enabled": false,
+  "take_profit_pct": 20,
+  "stop_loss_levels_pct": [10, 15],
+  "drawdown_status_pct": 5,
+  "drawdown_status_sec": 5,
+  "sell_pct": 100,
+  "sell_slippage_pct": 30,
+  "sell_priority_fee_sol": 0.001,
+  "sell_retry_sec": 30,
+  "env_path": ".env",
+  "keypair_env": "SOLANA_KEYPAIR",
+  "keypair_envs": {
+    "8BfDa8gQ8qv1x2r4p5Z6u7y8a9b0cD1e2f3G4h5J6k7": "SOLANA_KEYPAIR_1",
+    "H3kL9mN2pQ4rS6tU8vW1xY3zA5bC7dE9fG1hJ3kL5mN": "SOLANA_KEYPAIR_2"
+  },
+  "jupiter_api_key_env": "JUPITER_API_KEY",
+  "jupiter_headers": {}
 }
