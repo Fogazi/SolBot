@@ -52,6 +52,9 @@ TZ_OFFSET_MINUTES_DEFAULT = 570
 PRICE_WATCH_SYNC_SEC_DEFAULT = 60
 PRICE_MAX_RPM_DEFAULT = 60
 PRICE_BATCH_SIZE_DEFAULT = 50
+WS_PING_INTERVAL_DEFAULT = 20
+WS_PING_TIMEOUT_DEFAULT = 20
+WS_IDLE_RECONNECT_SEC_DEFAULT = 0
 GREEN_CIRCLE = "\U0001F7E2"
 RED_CIRCLE = "\U0001F534"
 WSOL_MINT = "So11111111111111111111111111111111111111112"
@@ -182,6 +185,15 @@ def parse_datetime_value(value: str, tz_offset_min: int) -> int | None:
     if dt.tzinfo is None:
         dt = dt.replace(tzinfo=timezone(timedelta(minutes=tz_offset_min)))
     return int(dt.timestamp())
+
+
+def resolve_commitment(value: str | None) -> str:
+    if not value:
+        return "confirmed"
+    normalized = str(value).strip().lower()
+    if normalized in {"confirmed", "finalized"}:
+        return normalized
+    return "confirmed"
 
 
 def iter_trade_log(path: Path):
@@ -726,6 +738,7 @@ def serialize_price_watch(price_watch: dict) -> dict:
                     else None
                 ),
                 "trailing_below_since": entry.get("trailing_below_since"),
+                "trailing_confirmed": bool(entry.get("trailing_confirmed", False)),
                 "buy_sol_used": (
                     str(entry.get("buy_sol_used"))
                     if entry.get("buy_sol_used") is not None
@@ -777,6 +790,7 @@ def load_price_watch(path: Path, wallets: set[str]) -> dict:
             "trailing_active": bool(entry.get("trailing_active", False)),
             "trailing_peak": parse_decimal(entry.get("trailing_peak")),
             "trailing_below_since": entry.get("trailing_below_since"),
+            "trailing_confirmed": bool(entry.get("trailing_confirmed", False)),
             "buy_sol_used": parse_decimal(entry.get("buy_sol_used")),
             "name": entry.get("name"),
             "symbol": entry.get("symbol"),
@@ -1937,6 +1951,7 @@ async def run_price_alerts(
                     "trailing_active": entry.get("trailing_active", False),
                     "trailing_peak": entry.get("trailing_peak"),
                     "trailing_below_since": entry.get("trailing_below_since"),
+                    "trailing_confirmed": entry.get("trailing_confirmed", False),
                     "name": entry.get("name"),
                     "symbol": entry.get("symbol"),
                     "marketcap": entry.get("marketcap"),
@@ -2077,6 +2092,7 @@ async def run_price_alerts(
                                 "trailing_active": True,
                                 "trailing_peak": price,
                                 "trailing_below_since": None,
+                                "trailing_confirmed": False,
                             }
                         )
 
@@ -2094,8 +2110,13 @@ async def run_price_alerts(
 
                         stop_price = trailing_peak * (Decimal(1) - trailing_drawdown_pct)
                         below_since = entry.get("trailing_below_since")
+                        confirmed = bool(entry.get("trailing_confirmed", False))
                         if price <= stop_price:
-                            if trailing_confirm_sec > 0:
+                            if entry.get("sell_inflight"):
+                                trailing_stop_hit = False
+                            elif confirmed:
+                                trailing_stop_hit = True
+                            elif trailing_confirm_sec > 0:
                                 now_epoch = time.time()
                                 if below_since is None:
                                     pending_updates.setdefault(
@@ -2122,12 +2143,28 @@ async def run_price_alerts(
                                         "confirm hit"
                                     )
                                     trailing_stop_hit = True
+                                    pending_updates.setdefault(
+                                        key, {"buy_price": buy_price, "changes": {}}
+                                    )["changes"].update(
+                                        {
+                                            "trailing_confirmed": True,
+                                            "trailing_below_since": None,
+                                        }
+                                    )
                             else:
                                 trailing_stop_hit = True
-                        elif below_since is not None:
+                                pending_updates.setdefault(
+                                    key, {"buy_price": buy_price, "changes": {}}
+                                )["changes"]["trailing_confirmed"] = True
+                        elif below_since is not None or confirmed:
                             pending_updates.setdefault(
                                 key, {"buy_price": buy_price, "changes": {}}
-                            )["changes"]["trailing_below_since"] = None
+                            )["changes"].update(
+                                {
+                                    "trailing_below_since": None,
+                                    "trailing_confirmed": False,
+                                }
+                            )
                             alerts.append(
                                 {
                                     "type": "TRAILING_TP",
@@ -2535,8 +2572,16 @@ async def listen_for_trades(config: dict):
         if wallet in trading_enabled_wallets and not bool(enabled):
             trading_enabled_wallets.discard(wallet)
     ws_url = config["rpc_ws"]
-    commitment = config.get("commitment", "confirmed")
-    commitment_fallback = False
+    commitment = resolve_commitment(config.get("commitment"))
+    ws_ping_interval = int(
+        config.get("ws_ping_interval", WS_PING_INTERVAL_DEFAULT)
+    )
+    ws_ping_timeout = int(
+        config.get("ws_ping_timeout", WS_PING_TIMEOUT_DEFAULT)
+    )
+    ws_idle_reconnect_sec = int(
+        config.get("ws_idle_reconnect_sec", WS_IDLE_RECONNECT_SEC_DEFAULT)
+    )
     token_list_url = config.get("jupiter_tokens_url", JUPITER_TOKENS_URL_DEFAULT)
     price_url = config.get("price_url", PRICE_URL_DEFAULT)
     swap_url = config.get("swap_url", SWAP_URL_DEFAULT)
@@ -2751,8 +2796,15 @@ async def listen_for_trades(config: dict):
     backoff = 1
     while True:
         try:
-            async with websockets.connect(ws_url, ping_interval=20, ping_timeout=20) as ws:
+            async with websockets.connect(
+                ws_url,
+                ping_interval=ws_ping_interval,
+                ping_timeout=ws_ping_timeout,
+            ) as ws:
                 wallet_by_sub_id, pending = await subscribe_wallets(ws, wallets, commitment)
+                print(
+                    f"ws connected ({commitment}); subscribed {len(wallets)} wallets"
+                )
 
                 backoff = 1
                 async def handle_message(msg: dict):
@@ -2920,9 +2972,23 @@ async def listen_for_trades(config: dict):
                 for msg in pending:
                     await handle_message(msg)
 
-                async for raw in ws:
-                    msg = json.loads(raw)
-                    await handle_message(msg)
+                if ws_idle_reconnect_sec > 0:
+                    while True:
+                        try:
+                            raw = await asyncio.wait_for(
+                                ws.recv(), timeout=ws_idle_reconnect_sec
+                            )
+                        except asyncio.TimeoutError:
+                            print(
+                                f"ws idle >{ws_idle_reconnect_sec}s; reconnecting"
+                            )
+                            break
+                        msg = json.loads(raw)
+                        await handle_message(msg)
+                else:
+                    async for raw in ws:
+                        msg = json.loads(raw)
+                        await handle_message(msg)
         except (websockets.WebSocketException, httpx.HTTPError, RuntimeError) as exc:
             err = exc
             err_payload = err.args[0] if err.args else None
@@ -2931,16 +2997,6 @@ async def listen_for_trades(config: dict):
                 msg = str(err_payload.get("message", ""))
             else:
                 msg = str(err)
-            if (
-                "commitment below" in msg.lower()
-                and "confirmed" in msg.lower()
-                and not commitment_fallback
-            ):
-                commitment = "confirmed"
-                commitment_fallback = True
-                print(
-                    "commitment rejected by RPC, falling back to confirmed"
-                )
             print(f"connection error: {exc}. reconnecting in {backoff}s")
             await asyncio.sleep(backoff)
             backoff = min(backoff * 2, 30)
@@ -3125,7 +3181,7 @@ def main():
             wallet_aliases = {}
         wallet = wallet_aliases.get(wallet_arg, wallet_arg)
         rpc_http = rpc_override or config.get("rpc_http_backfill") or config.get("rpc_http")
-        commitment = config.get("commitment", "confirmed")
+        commitment = resolve_commitment(config.get("commitment"))
         log_path = Path(
             config.get("trade_log_path", TRADE_LOG_PATH_DEFAULT)
             if isinstance(config, dict)
@@ -3279,7 +3335,7 @@ def main():
             wallet_aliases = {}
         wallet = wallet_aliases.get(wallet_arg, wallet_arg)
         rpc_http = rpc_override or config.get("rpc_http_backfill") or config.get("rpc_http")
-        commitment = config.get("commitment", "confirmed")
+        commitment = resolve_commitment(config.get("commitment"))
         log_path = Path(
             config.get("trade_log_path", TRADE_LOG_PATH_DEFAULT)
             if isinstance(config, dict)
@@ -3445,7 +3501,7 @@ def main():
             wallet_aliases = {}
         wallet = wallet_aliases.get(wallet_arg, wallet_arg)
         rpc_http = rpc_override or config.get("rpc_http_backfill") or config.get("rpc_http")
-        commitment = config.get("commitment", "confirmed")
+        commitment = resolve_commitment(config.get("commitment"))
         token_list_url = config.get("jupiter_tokens_url", JUPITER_TOKENS_URL_DEFAULT)
         refresh_sec = int(config.get("jupiter_refresh_sec", JUPITER_REFRESH_SEC_DEFAULT))
         tz_offset_min = int(
@@ -3618,7 +3674,7 @@ def main():
         if wallet_arg:
             wallets = [wallet_aliases.get(wallet_arg, wallet_arg)]
         rpc_http = rpc_override or config.get("rpc_http_backfill") or config.get("rpc_http")
-        commitment = config.get("commitment", "confirmed")
+        commitment = resolve_commitment(config.get("commitment"))
         token_list_url = config.get("jupiter_tokens_url", JUPITER_TOKENS_URL_DEFAULT)
         refresh_sec = int(config.get("jupiter_refresh_sec", JUPITER_REFRESH_SEC_DEFAULT))
         log_path = Path(
@@ -3811,7 +3867,7 @@ def main():
         if wallet_arg:
             wallets = [wallet_aliases.get(wallet_arg, wallet_arg)]
         rpc_http = rpc_override or config.get("rpc_http_backfill") or config.get("rpc_http")
-        commitment = config.get("commitment", "confirmed")
+        commitment = resolve_commitment(config.get("commitment"))
         token_list_url = config.get("jupiter_tokens_url", JUPITER_TOKENS_URL_DEFAULT)
         refresh_sec = int(config.get("jupiter_refresh_sec", JUPITER_REFRESH_SEC_DEFAULT))
         log_path = Path(
@@ -3999,7 +4055,7 @@ def main():
             except Exception:
                 config = {}
         rpc_http = rpc_override or config.get("rpc_http_backfill") or config.get("rpc_http")
-        commitment = config.get("commitment", "confirmed")
+        commitment = resolve_commitment(config.get("commitment"))
         log_path = Path(
             config.get("trade_log_path", TRADE_LOG_PATH_DEFAULT)
             if isinstance(config, dict)
