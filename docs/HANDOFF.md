@@ -13,6 +13,10 @@ Update this file when you stop working so the next session can pick up quickly.
 - Multi-wallet auto-sell supported via `keypair_envs` mapping; per-wallet trading can be toggled via `trade_control.json`.
 - Drawdown monitor logs `[LOSS]` at -5% (configurable).
 - README updated with `.env`, wallet aliases, trade control, stats usage, and timezone notes.
+- Trailing confirm debounce added: `trailing_confirm_sec` (0 to disable); logs confirm start/hit.
+- Price polling now logs effective poll rate (`[PRICE]`) based on rate-limit + batch size.
+- Discord webhook support for SELL logs (config `discord_webhook_url` / `DISCORD_WEBHOOK_URL`).
+- Backfill commands added: `backfill`, `backfill-open`, `backfill-buy`, `backfill-buys`, `recent-buys`, `rebuild-trade-log`.
 
 ## Decisions / Context
 - Price API V3 used for alerts (Ultra is swap execution, not price feed).
@@ -29,3 +33,4 @@ Update this file when you stop working so the next session can pick up quickly.
 - RPC 403s were observed; Ultra holdings now used for sell balance, but RPC is still used for tx parsing.
 - `config.json` may still contain secrets; `.env` is now ignored but `config.json` is not.
 - Review feedback pending: per-sell PnL uses tx SOL delta (bad for multi-sell tx); `stats --tz` arg order parsing bug.
+- `rebuild-trade-log` is destructive; use with a large `--since`/`--limit` or add backups.

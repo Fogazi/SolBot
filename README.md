@@ -54,20 +54,16 @@ For each detected trade:
 - Jupiter Ultra endpoints can change; if needed, update `jupiter_tokens_url` and `swap_url` in `config.json`.
 - `jupiter_tokens_url` supports list URLs or dynamic URLs that include `{ids}`, `{mint}`, or `{query}`.
 
-## Price Alerts
+## Price Watch
 
 When a BUY is detected, the bot records the current Jupiter Price API (USD) and
-alerts if the price drops 10% or rises 20% from that buy price.
-The watch list is persisted to `price_watch.json` by default.
-Trailing TP alerts can be enabled to arm at +20% and trigger on a 10% drawdown
-from the peak.
+tracks trailing TP and stop-loss logic against that buy price. The watch list is
+persisted to `price_watch.json` by default.
 
 Config options:
 - `price_url`: Price API endpoint (default `https://api.jup.ag/price/v3?ids={ids}`)
 - `price_poll_sec`: Polling interval in seconds
 - `price_watch_path`: File path for persisting buy prices and alert state
-- `alert_drop_pct`: Percent drop threshold (default 10)
-- `alert_rise_pct`: Percent rise threshold (default 20)
 - `trailing_start_pct`: Percent gain to arm the trailing TP (default 20)
 - `trailing_drawdown_pct`: Percent drawdown from peak to trigger (default 10)
 
@@ -117,28 +113,60 @@ Console timestamps use `tz_offset_minutes` (default `570` for GMT+9.5).
 To keep continuity between machines, update `docs/HANDOFF.md` when you stop work.
 Start each new session by asking Codex to read it.
 
-## Sync To Another PC (GitHub)
+## CLI Commands
 
-Use these steps on a second Windows PC to pick up the project:
-
-1) Install Git:
-```
-winget install --id Git.Git -e
-```
-
-2) Clone the repo (replace placeholders):
-```
-git clone https://github.com/<YOUR_USERNAME>/<YOUR_REPO>.git
-cd <YOUR_REPO>
+Trading toggle (runtime control via `trade_control.json`):
+```bash
+python bot.py trading --wallet <alias|address> --on
+python bot.py trading --wallet <alias|address> --off
 ```
 
-3) Create local config:
-```
-Copy-Item config.example.json config.json
+Stats (from local trade log):
+```bash
+python bot.py stats --since 12h
+python bot.py stats --from "2026-01-18 03:00:00" --to "2026-01-18 12:00:00"
+python bot.py stats --since 7d --tz 570
 ```
 
-4) Edit `config.json` and run:
+Open positions (from trade log + price watch comparison):
+```bash
+python bot.py positions
 ```
-python -m pip install -r requirements.txt
-python bot.py
+
+Backfill missing sells for open positions:
+```bash
+python bot.py backfill-open --since 2h --limit 500
+```
+
+Backfill missing sells for a specific wallet + mint:
+```bash
+python bot.py backfill --wallet <alias|address> --mint <mint> --since 2h --limit 500
+```
+
+Backfill missing buys for a specific wallet + mint:
+```bash
+python bot.py backfill-buy --wallet <alias|address> --mint <mint> --since 2h --limit 500
+```
+
+Backfill missing buys for all wallets (auto-detect):
+```bash
+python bot.py backfill-buys --since 2h --limit 50
+python bot.py backfill-buys --wallet <alias|address> --since 2h --limit 50
+```
+
+List recent buys to find a mint:
+```bash
+python bot.py recent-buys --wallet <alias|address> --since 2h --limit 50
+```
+
+Rebuild trade log from chain (destructive):
+```bash
+python bot.py rebuild-trade-log --since 6h --limit 2000
+python bot.py rebuild-trade-log --since 6h --limit 2000 --no-watch
+```
+
+Discord webhook test:
+```bash
+python bot.py webhook-test
+python bot.py webhook-test --message "Hello from SolBot"
 ```

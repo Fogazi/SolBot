@@ -6,6 +6,7 @@ import sys
 import time
 from datetime import datetime, timedelta, timezone
 import re
+import math
 from collections import deque
 from decimal import Decimal, ROUND_HALF_UP, ROUND_DOWN, getcontext
 from pathlib import Path
@@ -27,11 +28,10 @@ JUPITER_REFRESH_SEC_DEFAULT = 600
 PRICE_URL_DEFAULT = "https://api.jup.ag/price/v3?ids={ids}"
 SWAP_URL_DEFAULT = "https://api.jup.ag/ultra/v1"
 PRICE_POLL_SEC_DEFAULT = 30
-ALERT_DROP_PCT_DEFAULT = Decimal("10")
-ALERT_RISE_PCT_DEFAULT = Decimal("20")
 TRAILING_START_PCT_DEFAULT = Decimal("20")
 TRAILING_DRAWDOWN_PCT_DEFAULT = Decimal("10")
 TRAILING_STATUS_SEC_DEFAULT = 5
+TRAILING_CONFIRM_SEC_DEFAULT = 0
 TAKE_PROFIT_PCT_DEFAULT = Decimal("20")
 STOP_LOSS_LEVELS_PCT_DEFAULT = [Decimal("10"), Decimal("15")]
 DRAW_DOWN_STATUS_PCT_DEFAULT = Decimal("5")
@@ -40,12 +40,18 @@ SELL_PCT_DEFAULT = Decimal("100")
 SELL_SLIPPAGE_PCT_DEFAULT = Decimal("30")
 SELL_PRIORITY_FEE_SOL_DEFAULT = Decimal("0.001")
 SELL_RETRY_SEC_DEFAULT = 30
+SELL_INFLIGHT_TIMEOUT_SEC_DEFAULT = 60
+SELL_CONFIRM_DELAY_SEC_DEFAULT = 5
+SELL_CONFIRM_MAX_ATTEMPTS_DEFAULT = 3
 AUTO_SELL_ENABLED_DEFAULT = False
 ENV_PATH_DEFAULT = ".env"
 KEYPAIR_ENV_DEFAULT = "SOLANA_KEYPAIR"
 PRICE_WATCH_PATH_DEFAULT = "price_watch.json"
 TRADE_LOG_PATH_DEFAULT = "trade_log.jsonl"
 TZ_OFFSET_MINUTES_DEFAULT = 570
+PRICE_WATCH_SYNC_SEC_DEFAULT = 60
+PRICE_MAX_RPM_DEFAULT = 60
+PRICE_BATCH_SIZE_DEFAULT = 50
 GREEN_CIRCLE = "\U0001F7E2"
 RED_CIRCLE = "\U0001F534"
 WSOL_MINT = "So11111111111111111111111111111111111111112"
@@ -79,9 +85,42 @@ def append_trade_log(path: Path, entry: dict):
         if path.parent and not path.parent.exists():
             path.parent.mkdir(parents=True, exist_ok=True)
         with path.open("a", encoding="utf-8") as f:
-            f.write(json.dumps(entry, ensure_ascii=True) + "\n")
+            f.write(json.dumps(to_jsonable(entry), ensure_ascii=True) + "\n")
     except Exception as exc:
         print(f"trade log write error: {exc}")
+
+
+async def send_discord_webhook(
+    client: httpx.AsyncClient, url: str, content: str
+):
+    try:
+        resp = await client.post(url, json={"content": content})
+        resp.raise_for_status()
+    except Exception as exc:
+        print(f"webhook error: {exc}")
+
+
+def format_trade_message(summary: dict, trade: dict, tz_offset_min: int) -> str:
+    lines = []
+    side = trade.get("side") or "UNKNOWN"
+    name = trade.get("name") or "unknown"
+    symbol = trade.get("symbol") or "unknown"
+    lines.append(f"token: {name} ({symbol})")
+    sol_change = summary.get("sol_change") or Decimal(0)
+    if side == "SELL":
+        sol_received = max(sol_change, Decimal(0))
+        lines.append(f"sol received: {sol_received:.9f} SOL")
+        pnl_pct = trade.get("pnl_pct")
+        if pnl_pct is not None:
+            pnl_fmt = pnl_pct.quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
+            lines.append(f"pnl: {pnl_fmt:+f}%")
+    else:
+        sol_used = max(-sol_change, Decimal(0))
+        lines.append(f"sol used: {sol_used:.9f} SOL")
+    sol_balance_post = summary.get("sol_balance")
+    if sol_balance_post is not None:
+        lines.append(f"wallet balance: {sol_balance_post:.9f} SOL")
+    return "\n".join(lines)
 
 
 def load_trade_controls(
@@ -211,6 +250,13 @@ def print_trade_stats(
                 sol_received += sol_recv
                 sol_spent += buy_used
             pnl_pct = parse_decimal(entry.get("pnl_pct"))
+            if (
+                pnl_pct is None
+                and sol_recv is not None
+                and buy_used is not None
+                and buy_used > 0
+            ):
+                pnl_pct = ((sol_recv - buy_used) / buy_used) * Decimal(100)
             if pnl_pct is not None:
                 pnl_sum += pnl_pct
                 if pnl_pct > 0:
@@ -243,6 +289,203 @@ def print_trade_stats(
         print(f"Total PnL (net): {total_fmt:+f}%")
     print(f"Open positions: {open_positions}")
     print(f"Win/Loss (sells): {wins}/{losses}")
+
+
+def load_trade_log_entries(path: Path) -> list[dict]:
+    return list(iter_trade_log(path))
+
+
+def write_trade_log_entries(path: Path, entries: list[dict]) -> bool:
+    tmp_path = Path(str(path) + ".tmp")
+    try:
+        if path.parent and not path.parent.exists():
+            path.parent.mkdir(parents=True, exist_ok=True)
+        with tmp_path.open("w", encoding="utf-8") as f:
+            for entry in entries:
+                f.write(json.dumps(to_jsonable(entry), ensure_ascii=True) + "\n")
+        tmp_path.replace(path)
+        return True
+    except Exception as exc:
+        print(f"trade log write error: {exc}")
+        try:
+            if tmp_path.exists():
+                tmp_path.unlink()
+        except Exception:
+            pass
+        return False
+
+
+def to_jsonable(value):
+    if isinstance(value, Decimal):
+        return str(value)
+    if isinstance(value, dict):
+        return {k: to_jsonable(v) for k, v in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [to_jsonable(v) for v in value]
+    return value
+
+
+def log_entry_ts(entry: dict) -> int:
+    return int(entry.get("ts") or entry.get("detected_ts") or 0)
+
+
+def pop_open_position(positions: dict, key: tuple[str, str]):
+    queue = positions.get(key)
+    if isinstance(queue, dict):
+        queue = queue.get("buys")
+        if queue is None:
+            return None
+        positions[key] = queue
+    if not queue:
+        return None
+    value = queue.popleft()
+    if not queue:
+        positions.pop(key, None)
+    if isinstance(value, dict):
+        return parse_decimal(value.get("sol_used"))
+    return parse_decimal(value)
+
+
+def build_trade_log_index(entries: list[dict]):
+    positions = {}
+    sell_sigs = {}
+    meta = {}
+    for entry in entries:
+        wallet = entry.get("wallet")
+        mint = entry.get("mint")
+        side = entry.get("side")
+        if not wallet or not mint or side not in ("BUY", "SELL"):
+            continue
+        key = (wallet, mint)
+        meta_slot = meta.setdefault(
+            key, {"name": None, "symbol": None, "marketcap": None}
+        )
+        if entry.get("name"):
+            meta_slot["name"] = entry.get("name")
+        if entry.get("symbol"):
+            meta_slot["symbol"] = entry.get("symbol")
+        if entry.get("marketcap"):
+            meta_slot["marketcap"] = entry.get("marketcap")
+        if side == "SELL":
+            sig = entry.get("signature")
+            if sig:
+                sell_sigs.setdefault(key, set()).add(sig)
+        if side == "BUY":
+            slot = positions.setdefault(key, {"buys": deque()})
+            slot["buys"].append(
+                {
+                    "ts": entry.get("ts") or entry.get("detected_ts"),
+                    "sol_used": parse_decimal(entry.get("sol_used")),
+                }
+            )
+        elif side == "SELL":
+            slot = positions.get(key)
+            if slot and slot["buys"]:
+                slot["buys"].popleft()
+                if not slot["buys"]:
+                    positions.pop(key, None)
+    return positions, sell_sigs, meta
+
+
+def sync_price_watch_with_log(watch_path: Path, log_entries: list[dict]) -> int:
+    if not watch_path.exists():
+        return 0
+    watch = load_price_watch(watch_path, set())
+    return sync_price_watch_with_log_entries(watch, log_entries, watch_path)
+
+
+def sync_price_watch_with_log_entries(
+    price_watch: dict, log_entries: list[dict], watch_path: Path
+) -> int:
+    positions, _, _ = build_trade_log_index(log_entries)
+    open_keys = set(positions.keys())
+    removed = 0
+    for key in list(price_watch.keys()):
+        if key not in open_keys:
+            price_watch.pop(key, None)
+            removed += 1
+    if removed:
+        save_price_watch(watch_path, price_watch)
+    return removed
+
+
+def print_open_positions(
+    log_path: Path,
+    tz_offset_min: int,
+    watch_path: Path | None = None,
+):
+    entries = load_trade_log_entries(log_path)
+    positions, _, meta = build_trade_log_index(entries)
+
+    if not positions:
+        print("No open positions found in trade log.")
+        return
+
+    items = []
+    for (wallet, mint), data in positions.items():
+        buys = data.get("buys") or deque()
+        if not buys:
+            continue
+        meta_slot = meta.get((wallet, mint), {})
+        last_ts = None
+        total_sol_used = Decimal(0)
+        sol_count = 0
+        for buy in buys:
+            ts_val = buy.get("ts")
+            if ts_val:
+                last_ts = ts_val if last_ts is None else max(last_ts, ts_val)
+            sol_used = buy.get("sol_used")
+            if sol_used is not None:
+                total_sol_used += sol_used
+                sol_count += 1
+        items.append(
+            {
+                "wallet": wallet,
+                "mint": mint,
+                "name": meta_slot.get("name") or "unknown",
+                "symbol": meta_slot.get("symbol") or "unknown",
+                "open_buys": len(buys),
+                "total_sol_used": total_sol_used if sol_count else None,
+                "last_ts": last_ts,
+            }
+        )
+
+    items.sort(
+        key=lambda item: item["last_ts"] or 0,
+        reverse=True,
+    )
+    open_slots = sum(item["open_buys"] for item in items)
+    print(f"Open positions (buys not sold): {open_slots}")
+    print(f"Distinct wallet+mint: {len(items)}")
+    for item in items:
+        print("")
+        print(f"wallet: {item['wallet']}")
+        print(f"token: {item['name']} ({item['symbol']})")
+        print(f"mint: {item['mint']}")
+        print(f"open buys: {item['open_buys']}")
+        if item["total_sol_used"] is not None:
+            print(f"sol used (open): {item['total_sol_used']:.9f} SOL")
+        if item["last_ts"]:
+            print(f"last buy: {format_ts(item['last_ts'], tz_offset_min)}")
+
+    if watch_path and watch_path.exists():
+        watch = load_price_watch(watch_path, set())
+        open_keys = {(item["wallet"], item["mint"]) for item in items}
+        watch_keys = set(watch.keys())
+        missing_in_watch = sorted(open_keys - watch_keys)
+        extra_in_watch = sorted(watch_keys - open_keys)
+        print("")
+        print(f"Price watch entries: {len(watch_keys)}")
+        if missing_in_watch:
+            print(f"Missing in price watch: {len(missing_in_watch)}")
+            for wallet, mint in missing_in_watch:
+                print(f"- {wallet} | {mint}")
+        if extra_in_watch:
+            print(f"Extra in price watch: {len(extra_in_watch)}")
+            for wallet, mint in extra_in_watch:
+                entry = watch.get((wallet, mint), {})
+                symbol = entry.get("symbol") or entry.get("name") or "unknown"
+                print(f"- {wallet} | {symbol} | {mint}")
 
 
 def load_env_file(path: Path):
@@ -476,14 +719,13 @@ def serialize_price_watch(price_watch: dict) -> dict:
                 "wallet": wallet,
                 "mint": mint,
                 "buy_price": str(buy_price),
-                "alerted_down": bool(entry.get("alerted_down", False)),
-                "alerted_up": bool(entry.get("alerted_up", False)),
                 "trailing_active": bool(entry.get("trailing_active", False)),
                 "trailing_peak": (
                     str(entry.get("trailing_peak"))
                     if entry.get("trailing_peak") is not None
                     else None
                 ),
+                "trailing_below_since": entry.get("trailing_below_since"),
                 "buy_sol_used": (
                     str(entry.get("buy_sol_used"))
                     if entry.get("buy_sol_used") is not None
@@ -532,10 +774,9 @@ def load_price_watch(path: Path, wallets: set[str]) -> dict:
             continue
         price_watch[(wallet, mint)] = {
             "buy_price": buy_price,
-            "alerted_down": bool(entry.get("alerted_down", False)),
-            "alerted_up": bool(entry.get("alerted_up", False)),
             "trailing_active": bool(entry.get("trailing_active", False)),
             "trailing_peak": parse_decimal(entry.get("trailing_peak")),
+            "trailing_below_since": entry.get("trailing_below_since"),
             "buy_sol_used": parse_decimal(entry.get("buy_sol_used")),
             "name": entry.get("name"),
             "symbol": entry.get("symbol"),
@@ -875,9 +1116,12 @@ class JupiterTokenCache:
 
 
 class JupiterPriceClient:
-    def __init__(self, url: str, headers: dict, timeout_sec: int = 20):
+    def __init__(
+        self, url: str, headers: dict, timeout_sec: int = 20, batch_size: int = 50
+    ):
         self.url = url
         self.headers = headers
+        self.batch_size = max(1, int(batch_size))
         self.client = httpx.AsyncClient(timeout=timeout_sec)
 
     def _build_url(self, ids: list[str]):
@@ -892,7 +1136,7 @@ class JupiterPriceClient:
         if not ids:
             return {}
         result = {}
-        for batch in chunked(ids, 50):
+        for batch in chunked(ids, self.batch_size):
             url = self._build_url(batch)
             resp = await self.client.get(url, headers=self.headers)
             resp.raise_for_status()
@@ -986,6 +1230,441 @@ async def fetch_transaction(rpc: RpcClient, signature: str, commitment: str, ret
             return result
         await asyncio.sleep(1 + attempt)
     return None
+
+
+async def fetch_signatures_for_address(
+    rpc: RpcClient,
+    address: str,
+    limit: int = 100,
+    before: str | None = None,
+):
+    params = {"limit": limit}
+    if before:
+        params["before"] = before
+    result = await rpc.call("getSignaturesForAddress", [address, params])
+    if not isinstance(result, list):
+        return []
+    return result
+
+
+async def collect_missing_sell_entries(
+    rpc: RpcClient,
+    wallet: str,
+    mint: str,
+    commitment: str,
+    since: int | None,
+    limit: int,
+    logged_sell_sigs: set[str],
+    meta_name: str | None,
+    meta_symbol: str | None,
+    meta_mcap: str | None,
+):
+    new_entries = []
+    before = None
+    remaining = max(1, limit)
+    stop = False
+    while remaining > 0 and not stop:
+        try:
+            batch = await fetch_signatures_for_address(
+                rpc,
+                wallet,
+                limit=min(1000, remaining),
+                before=before,
+            )
+        except httpx.HTTPError as exc:
+            print(f"RPC error fetching signatures for {wallet}: {exc}")
+            break
+        if not batch:
+            break
+        for sig_info in batch:
+            sig = sig_info.get("signature")
+            if not sig or sig in logged_sell_sigs:
+                continue
+            block_time = sig_info.get("blockTime")
+            if since and block_time and block_time < since:
+                stop = True
+                break
+            try:
+                tx = await fetch_transaction(rpc, sig, commitment)
+            except httpx.HTTPError as exc:
+                print(f"RPC error fetching transaction {sig}: {exc}")
+                continue
+            if not tx:
+                continue
+            summary = summarize_trades(
+                signature=sig,
+                slot=tx.get("slot") or sig_info.get("slot") or 0,
+                block_time=tx.get("blockTime") or block_time or 0,
+                wallet=wallet,
+                tx=tx,
+            )
+            if not summary:
+                continue
+            for trade in summary.get("trades", []):
+                if trade.get("mint") != mint or trade.get("side") != "SELL":
+                    continue
+                sol_change = parse_decimal(summary.get("sol_change")) or Decimal(0)
+                sol_received = max(sol_change, Decimal(0))
+                amount_raw = trade.get("amount_raw")
+                decimals = trade.get("decimals")
+                amount_ui = (
+                    format_amount(amount_raw, decimals)
+                    if amount_raw is not None and decimals is not None
+                    else None
+                )
+                entry = {
+                    "ts": summary.get("block_time"),
+                    "detected_ts": int(time.time()),
+                    "signature": summary.get("signature"),
+                    "slot": summary.get("slot"),
+                    "wallet": summary.get("wallet"),
+                    "side": trade.get("side"),
+                    "mint": trade.get("mint"),
+                    "name": meta_name or "unknown",
+                    "symbol": meta_symbol or "unknown",
+                    "marketcap": meta_mcap,
+                    "amount_raw": amount_raw,
+                    "decimals": decimals,
+                    "amount_ui": amount_ui,
+                    "sol_change": str(summary.get("sol_change"))
+                    if summary.get("sol_change") is not None
+                    else None,
+                    "sol_used": None,
+                    "sol_received": str(sol_received),
+                    "buy_sol_used": None,
+                    "sol_balance": str(summary.get("sol_balance"))
+                    if summary.get("sol_balance") is not None
+                    else None,
+                    "buy_price": None,
+                    "pnl_pct": None,
+                }
+                new_entries.append(entry)
+        before = batch[-1].get("signature")
+        remaining -= len(batch)
+    return new_entries
+
+
+async def collect_missing_buy_entries(
+    rpc: RpcClient,
+    wallet: str,
+    mint: str,
+    commitment: str,
+    since: int | None,
+    limit: int,
+    logged_buy_sigs: set[str],
+    meta_name: str | None,
+    meta_symbol: str | None,
+    meta_mcap: str | None,
+):
+    new_entries = []
+    before = None
+    remaining = max(1, limit)
+    stop = False
+    while remaining > 0 and not stop:
+        try:
+            batch = await fetch_signatures_for_address(
+                rpc,
+                wallet,
+                limit=min(1000, remaining),
+                before=before,
+            )
+        except httpx.HTTPError as exc:
+            print(f"RPC error fetching signatures for {wallet}: {exc}")
+            break
+        if not batch:
+            break
+        for sig_info in batch:
+            sig = sig_info.get("signature")
+            if not sig or sig in logged_buy_sigs:
+                continue
+            block_time = sig_info.get("blockTime")
+            if since and block_time and block_time < since:
+                stop = True
+                break
+            try:
+                tx = await fetch_transaction(rpc, sig, commitment)
+            except httpx.HTTPError as exc:
+                print(f"RPC error fetching transaction {sig}: {exc}")
+                continue
+            if not tx:
+                continue
+            summary = summarize_trades(
+                signature=sig,
+                slot=tx.get("slot") or sig_info.get("slot") or 0,
+                block_time=tx.get("blockTime") or block_time or 0,
+                wallet=wallet,
+                tx=tx,
+            )
+            if not summary:
+                continue
+            for trade in summary.get("trades", []):
+                if trade.get("mint") != mint or trade.get("side") != "BUY":
+                    continue
+                sol_change = parse_decimal(summary.get("sol_change")) or Decimal(0)
+                sol_used = max(-sol_change, Decimal(0))
+                amount_raw = trade.get("amount_raw")
+                decimals = trade.get("decimals")
+                amount_ui = (
+                    format_amount(amount_raw, decimals)
+                    if amount_raw is not None and decimals is not None
+                    else None
+                )
+                entry = {
+                    "ts": summary.get("block_time"),
+                    "detected_ts": int(time.time()),
+                    "signature": summary.get("signature"),
+                    "slot": summary.get("slot"),
+                    "wallet": summary.get("wallet"),
+                    "side": trade.get("side"),
+                    "mint": trade.get("mint"),
+                    "name": meta_name or "unknown",
+                    "symbol": meta_symbol or "unknown",
+                    "marketcap": meta_mcap,
+                    "amount_raw": amount_raw,
+                    "decimals": decimals,
+                    "amount_ui": amount_ui,
+                    "sol_change": str(summary.get("sol_change"))
+                    if summary.get("sol_change") is not None
+                    else None,
+                    "sol_used": str(sol_used),
+                    "sol_received": None,
+                    "buy_sol_used": str(sol_used),
+                    "sol_balance": str(summary.get("sol_balance"))
+                    if summary.get("sol_balance") is not None
+                    else None,
+                    "buy_price": None,
+                    "pnl_pct": None,
+                }
+                new_entries.append(entry)
+        before = batch[-1].get("signature")
+        remaining -= len(batch)
+    return new_entries
+
+
+async def collect_missing_buys_for_wallet(
+    rpc: RpcClient,
+    token_cache: "JupiterTokenCache",
+    wallet: str,
+    commitment: str,
+    since: int | None,
+    limit: int,
+    logged_buy_keys: set[tuple[str, str, str]],
+):
+    new_entries = []
+    before = None
+    remaining = max(1, limit * 5)
+    found = 0
+    stop = False
+    while remaining > 0 and not stop:
+        try:
+            batch = await fetch_signatures_for_address(
+                rpc,
+                wallet,
+                limit=min(1000, remaining),
+                before=before,
+            )
+        except httpx.HTTPError as exc:
+            print(f"RPC error fetching signatures for {wallet}: {exc}")
+            break
+        if not batch:
+            break
+        for sig_info in batch:
+            sig = sig_info.get("signature")
+            if not sig:
+                continue
+            block_time = sig_info.get("blockTime")
+            if since and block_time and block_time < since:
+                stop = True
+                break
+            try:
+                tx = await fetch_transaction(rpc, sig, commitment)
+            except httpx.HTTPError as exc:
+                print(f"RPC error fetching transaction {sig}: {exc}")
+                continue
+            if not tx:
+                continue
+            summary = summarize_trades(
+                signature=sig,
+                slot=tx.get("slot") or sig_info.get("slot") or 0,
+                block_time=tx.get("blockTime") or block_time or 0,
+                wallet=wallet,
+                tx=tx,
+            )
+            if not summary:
+                continue
+            buys = [t for t in summary.get("trades", []) if t.get("side") == "BUY"]
+            if not buys:
+                continue
+            mints = [t.get("mint") for t in buys if t.get("mint")]
+            if mints:
+                try:
+                    await token_cache.ensure(mints)
+                except Exception:
+                    pass
+            sol_used = max(-summary.get("sol_change", Decimal(0)), Decimal(0))
+            for trade in buys:
+                mint = trade.get("mint")
+                if not mint:
+                    continue
+                key = (wallet, sig, mint)
+                if key in logged_buy_keys:
+                    continue
+                meta = token_cache.get(mint) or {}
+                name = meta.get("name") or trade.get("name") or "unknown"
+                symbol = meta.get("symbol") or trade.get("symbol") or "unknown"
+                amount_raw = trade.get("amount_raw")
+                decimals = trade.get("decimals")
+                amount_ui = (
+                    format_amount(amount_raw, decimals)
+                    if amount_raw is not None and decimals is not None
+                    else None
+                )
+                entry = {
+                    "ts": summary.get("block_time"),
+                    "detected_ts": int(time.time()),
+                    "signature": summary.get("signature"),
+                    "slot": summary.get("slot"),
+                    "wallet": summary.get("wallet"),
+                    "side": trade.get("side"),
+                    "mint": mint,
+                    "name": name,
+                    "symbol": symbol,
+                    "marketcap": meta.get("mcap"),
+                    "amount_raw": amount_raw,
+                    "decimals": decimals,
+                    "amount_ui": amount_ui,
+                    "sol_change": str(summary.get("sol_change"))
+                    if summary.get("sol_change") is not None
+                    else None,
+                    "sol_used": str(sol_used),
+                    "sol_received": None,
+                    "buy_sol_used": str(sol_used),
+                    "sol_balance": str(summary.get("sol_balance"))
+                    if summary.get("sol_balance") is not None
+                    else None,
+                    "buy_price": None,
+                    "pnl_pct": None,
+                }
+                new_entries.append(entry)
+                logged_buy_keys.add(key)
+                found += 1
+                if found >= limit:
+                    stop = True
+                    break
+            if stop:
+                break
+        before = batch[-1].get("signature")
+        remaining -= len(batch)
+    return new_entries
+
+
+async def rebuild_trade_log_from_chain(
+    rpc: RpcClient,
+    token_cache: "JupiterTokenCache",
+    wallets: list[str],
+    commitment: str,
+    since: int | None,
+    limit: int,
+):
+    entries = []
+    for wallet in wallets:
+        before = None
+        remaining = max(1, limit)
+        stop = False
+        while remaining > 0 and not stop:
+            try:
+                batch = await fetch_signatures_for_address(
+                    rpc,
+                    wallet,
+                    limit=min(1000, remaining),
+                    before=before,
+                )
+            except httpx.HTTPError as exc:
+                print(f"RPC error fetching signatures for {wallet}: {exc}")
+                break
+            if not batch:
+                break
+            for sig_info in batch:
+                sig = sig_info.get("signature")
+                if not sig:
+                    continue
+                block_time = sig_info.get("blockTime")
+                if since and block_time and block_time < since:
+                    stop = True
+                    break
+                try:
+                    tx = await fetch_transaction(rpc, sig, commitment)
+                except httpx.HTTPError as exc:
+                    print(f"RPC error fetching transaction {sig}: {exc}")
+                    continue
+                if not tx:
+                    continue
+                summary = summarize_trades(
+                    signature=sig,
+                    slot=tx.get("slot") or sig_info.get("slot") or 0,
+                    block_time=tx.get("blockTime") or block_time or 0,
+                    wallet=wallet,
+                    tx=tx,
+                )
+                if not summary:
+                    continue
+                mints = [t.get("mint") for t in summary.get("trades", []) if t.get("mint")]
+                if mints:
+                    try:
+                        await token_cache.ensure(mints)
+                    except Exception:
+                        pass
+                sol_change = parse_decimal(summary.get("sol_change")) or Decimal(0)
+                sol_used = max(-sol_change, Decimal(0))
+                sol_received = max(sol_change, Decimal(0))
+                for trade in summary.get("trades", []):
+                    mint = trade.get("mint")
+                    if not mint:
+                        continue
+                    meta = token_cache.get(mint) or {}
+                    name = meta.get("name") or trade.get("name") or "unknown"
+                    symbol = meta.get("symbol") or trade.get("symbol") or "unknown"
+                    amount_raw = trade.get("amount_raw")
+                    decimals = trade.get("decimals")
+                    amount_ui = (
+                        format_amount(amount_raw, decimals)
+                        if amount_raw is not None and decimals is not None
+                        else None
+                    )
+                    entry = {
+                        "ts": summary.get("block_time"),
+                        "detected_ts": int(time.time()),
+                        "signature": summary.get("signature"),
+                        "slot": summary.get("slot"),
+                        "wallet": summary.get("wallet"),
+                        "side": trade.get("side"),
+                        "mint": mint,
+                        "name": name,
+                        "symbol": symbol,
+                        "marketcap": meta.get("mcap"),
+                        "amount_raw": amount_raw,
+                        "decimals": decimals,
+                        "amount_ui": amount_ui,
+                        "sol_change": str(summary.get("sol_change"))
+                        if summary.get("sol_change") is not None
+                        else None,
+                        "sol_used": str(sol_used) if trade.get("side") == "BUY" else None,
+                        "sol_received": str(sol_received)
+                        if trade.get("side") == "SELL"
+                        else None,
+                        "buy_sol_used": str(sol_used)
+                        if trade.get("side") == "BUY"
+                        else None,
+                        "sol_balance": str(summary.get("sol_balance"))
+                        if summary.get("sol_balance") is not None
+                        else None,
+                        "buy_price": None,
+                        "pnl_pct": None,
+                    }
+                    entries.append(entry)
+            before = batch[-1].get("signature")
+            remaining -= len(batch)
+    return entries
 
 
 def summarize_trades(signature: str, slot: int, block_time: int, wallet: str, tx: dict):
@@ -1130,8 +1809,6 @@ async def run_price_alerts(
     price_watch: dict,
     price_lock: asyncio.Lock,
     price_watch_path: Path,
-    drop_pct: Decimal,
-    rise_pct: Decimal,
     poll_sec: int,
     trailing_start_pct: Decimal,
     trailing_drawdown_pct: Decimal,
@@ -1154,15 +1831,17 @@ async def run_price_alerts(
     trade_control_poll_sec: int,
     wallet_aliases: dict,
     tracked_wallets: set[str],
+    trade_log_path: Path | None,
+    price_watch_sync_sec: int,
+    price_max_rpm: int,
+    price_batch_size: int,
+    sell_inflight_timeout_sec: int,
+    trailing_confirm_sec: int,
+    sell_confirm_delay_sec: int,
+    sell_confirm_max_attempts: int,
 ):
     if poll_sec <= 0:
         return
-    drop_threshold = (drop_pct * Decimal(100)).quantize(
-        Decimal("0.01"), rounding=ROUND_HALF_UP
-    )
-    rise_threshold = (rise_pct * Decimal(100)).quantize(
-        Decimal("0.01"), rounding=ROUND_HALF_UP
-    )
     trailing_start_threshold = (trailing_start_pct * Decimal(100)).quantize(
         Decimal("0.01"), rounding=ROUND_HALF_UP
     )
@@ -1191,6 +1870,9 @@ async def run_price_alerts(
     last_control_check = 0.0
     last_control_mtime = None
     base_trading_enabled_wallets = set(trading_enabled_wallets)
+    last_effective_trading = None
+    last_watch_sync = 0.0
+    last_poll_info = None
     next_sleep = poll_sec
     while True:
         try:
@@ -1222,14 +1904,39 @@ async def run_price_alerts(
                         trading_enabled_wallets.add(wallet)
                     else:
                         trading_enabled_wallets.discard(wallet)
+            effective_trading = {
+                wallet: wallet in trading_enabled_wallets for wallet in tracked_wallets
+            }
+            if last_effective_trading is None:
+                last_effective_trading = effective_trading
+            else:
+                ts_str = format_ts(time.time(), tz_offset_min)
+                for wallet, enabled in effective_trading.items():
+                    if last_effective_trading.get(wallet) != enabled:
+                        state = "enabled" if enabled else "disabled"
+                        print(f"[CONTROL] {ts_str} | wallet {wallet} | trading {state}")
+                last_effective_trading = effective_trading
+            if trade_log_path and price_watch_sync_sec > 0:
+                now = time.monotonic()
+                if now - last_watch_sync >= price_watch_sync_sec:
+                    last_watch_sync = now
+                    entries = load_trade_log_entries(trade_log_path)
+                    async with price_lock:
+                        removed = sync_price_watch_with_log_entries(
+                            price_watch, entries, price_watch_path
+                        )
+                    if removed:
+                        ts_str = format_ts(time.time(), tz_offset_min)
+                        print(
+                            f"[WATCH] {ts_str} | removed {removed} stale entries"
+                        )
             async with price_lock:
                 watch_snapshot = {
                     key: {
                         "buy_price": entry.get("buy_price"),
-                        "alerted_down": entry.get("alerted_down", False),
-                        "alerted_up": entry.get("alerted_up", False),
                     "trailing_active": entry.get("trailing_active", False),
                     "trailing_peak": entry.get("trailing_peak"),
+                    "trailing_below_since": entry.get("trailing_below_since"),
                     "name": entry.get("name"),
                     "symbol": entry.get("symbol"),
                     "marketcap": entry.get("marketcap"),
@@ -1238,7 +1945,9 @@ async def run_price_alerts(
                     "sell_last_attempt": entry.get("sell_last_attempt", 0),
                     "sell_last_reason": entry.get("sell_last_reason"),
                     "sell_skip_reason": entry.get("sell_skip_reason"),
-                        "sell_skip_logged_at": entry.get("sell_skip_logged_at", 0),
+                    "sell_confirm_due": entry.get("sell_confirm_due"),
+                    "sell_confirm_attempts": entry.get("sell_confirm_attempts", 0),
+                    "sell_skip_logged_at": entry.get("sell_skip_logged_at", 0),
                     }
                     for key, entry in price_watch.items()
                 }
@@ -1246,10 +1955,80 @@ async def run_price_alerts(
                 next_sleep = poll_sec
                 continue
 
+            if (
+                swap_client
+                and sell_confirm_delay_sec > 0
+                and sell_confirm_max_attempts > 0
+            ):
+                confirm_candidates = []
+                for (wallet, mint), entry in watch_snapshot.items():
+                    if not entry.get("sell_inflight"):
+                        continue
+                    due = entry.get("sell_confirm_due")
+                    if due is None or status_now < float(due):
+                        continue
+                    confirm_candidates.append(
+                        {
+                            "wallet": wallet,
+                            "mint": mint,
+                            "symbol": entry.get("symbol") or entry.get("name") or mint,
+                            "attempts": int(entry.get("sell_confirm_attempts", 0)),
+                        }
+                    )
+                for candidate in confirm_candidates:
+                    try:
+                        total_raw, _ = await fetch_token_balance_ultra(
+                            swap_client, candidate["wallet"], candidate["mint"]
+                        )
+                    except Exception as exc:
+                        print(f"sell confirm error: {exc}")
+                        total_raw = None
+                    async with price_lock:
+                        entry = price_watch.get((candidate["wallet"], candidate["mint"]))
+                        if not entry:
+                            continue
+                        if total_raw is not None and total_raw <= 0:
+                            price_watch.pop(
+                                (candidate["wallet"], candidate["mint"]), None
+                            )
+                            save_price_watch(price_watch_path, price_watch)
+                            ts_str = format_ts(time.time(), tz_offset_min)
+                            print(
+                                f"[SELL] {ts_str} | {candidate['symbol']} | "
+                                "confirmed (balance zero)"
+                            )
+                            continue
+                        attempts = candidate["attempts"] + 1
+                        if attempts >= sell_confirm_max_attempts:
+                            entry["sell_confirm_due"] = None
+                            entry["sell_confirm_attempts"] = attempts
+                        else:
+                            entry["sell_confirm_attempts"] = attempts
+                            entry["sell_confirm_due"] = (
+                                time.monotonic() + sell_confirm_delay_sec
+                            )
+
             mints = sorted({mint for (_, mint) in watch_snapshot.keys()})
+            batches = 1
+            if price_batch_size > 0:
+                batches = max(1, math.ceil(len(mints) / price_batch_size))
+            rate_limit_sec = 0
+            if price_max_rpm > 0:
+                rate_limit_sec = max(
+                    1, math.ceil((batches * 60) / price_max_rpm)
+                )
+            effective_poll_sec = max(poll_sec, rate_limit_sec)
+            poll_info = (len(mints), batches, effective_poll_sec)
+            if poll_info != last_poll_info:
+                last_poll_info = poll_info
+                ts_str = format_ts(time.time(), tz_offset_min)
+                print(
+                    f"[PRICE] {ts_str} | tracked {len(mints)} | "
+                    f"batches {batches} | poll {effective_poll_sec}s"
+                )
             prices = await price_client.fetch_prices(mints)
             if not prices:
-                next_sleep = poll_sec
+                next_sleep = effective_poll_sec
                 continue
 
             alerts = []
@@ -1297,6 +2076,7 @@ async def run_price_alerts(
                             {
                                 "trailing_active": True,
                                 "trailing_peak": price,
+                                "trailing_below_since": None,
                             }
                         )
 
@@ -1313,7 +2093,41 @@ async def run_price_alerts(
                             )["changes"]["trailing_peak"] = price
 
                         stop_price = trailing_peak * (Decimal(1) - trailing_drawdown_pct)
+                        below_since = entry.get("trailing_below_since")
                         if price <= stop_price:
+                            if trailing_confirm_sec > 0:
+                                now_epoch = time.time()
+                                if below_since is None:
+                                    pending_updates.setdefault(
+                                        key, {"buy_price": buy_price, "changes": {}}
+                                    )["changes"]["trailing_below_since"] = now_epoch
+                                    symbol = entry.get("symbol") or entry.get("name") or mint
+                                    change_pct = (change * Decimal(100)).quantize(
+                                        Decimal("0.01"), rounding=ROUND_HALF_UP
+                                    )
+                                    stop_pct = (
+                                        (stop_price - buy_price) / buy_price * Decimal(100)
+                                    ).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
+                                    ts_str = format_ts(time.time(), tz_offset_min)
+                                    print(
+                                        f"[TRAIL] {ts_str} | {symbol} | "
+                                        f"confirm start | {change_pct:+f}% | "
+                                        f"stop {stop_pct:+f}%"
+                                    )
+                                elif now_epoch - float(below_since) >= trailing_confirm_sec:
+                                    symbol = entry.get("symbol") or entry.get("name") or mint
+                                    ts_str = format_ts(time.time(), tz_offset_min)
+                                    print(
+                                        f"[TRAIL] {ts_str} | {symbol} | "
+                                        "confirm hit"
+                                    )
+                                    trailing_stop_hit = True
+                            else:
+                                trailing_stop_hit = True
+                        elif below_since is not None:
+                            pending_updates.setdefault(
+                                key, {"buy_price": buy_price, "changes": {}}
+                            )["changes"]["trailing_below_since"] = None
                             alerts.append(
                                 {
                                     "type": "TRAILING_TP",
@@ -1328,38 +2142,7 @@ async def run_price_alerts(
                             )
                             trailing_stop_hit = True
 
-                if change <= -drop_pct and not entry.get("alerted_down"):
-                    alerts.append(
-                        {
-                            "type": "DROP",
-                            "wallet": wallet,
-                            "mint": mint,
-                            "entry": entry,
-                            "price": price,
-                            "buy_price": buy_price,
-                            "change": change,
-                        }
-                    )
-                    pending_updates.setdefault(key, {"buy_price": buy_price, "changes": {}})[
-                        "changes"
-                    ]["alerted_down"] = True
-                if change >= rise_pct and not entry.get("alerted_up"):
-                    alerts.append(
-                        {
-                            "type": "RISE",
-                            "wallet": wallet,
-                            "mint": mint,
-                            "entry": entry,
-                            "price": price,
-                            "buy_price": buy_price,
-                            "change": change,
-                        }
-                    )
-                    pending_updates.setdefault(key, {"buy_price": buy_price, "changes": {}})[
-                        "changes"
-                    ]["alerted_up"] = True
-
-                if status_enabled and trailing_active:
+                if status_enabled and trailing_active and not entry.get("sell_inflight"):
                     last_ts = last_status.get(key, 0)
                     if status_now - last_ts >= trailing_status_sec:
                         symbol = entry.get("symbol") or entry.get("name") or mint
@@ -1370,19 +2153,22 @@ async def run_price_alerts(
                         stop_gain = (stop_price - buy_price) / buy_price
                         base_mcap = entry.get("marketcap")
                         stop_mcap = None
+                        current_mcap = None
                         if base_mcap is not None:
                             stop_mcap = base_mcap * (Decimal(1) + stop_gain)
+                            current_mcap = base_mcap * (Decimal(1) + change)
                         status_updates.append(
                             {
                                 "symbol": symbol,
                                 "change": change,
                                 "stop_gain": stop_gain,
                                 "stop_mcap": stop_mcap,
+                                "current_mcap": current_mcap,
                             }
                         )
                         last_status[key] = status_now
 
-                if drawdown_status_ratio > 0:
+                if drawdown_status_ratio > 0 and not entry.get("sell_inflight"):
                     if change <= -drawdown_status_ratio:
                         last_ts = last_drawdown_status.get(key, 0)
                         if status_now - last_ts >= drawdown_status_sec:
@@ -1442,9 +2228,9 @@ async def run_price_alerts(
                     sell_inflight = bool(entry.get("sell_inflight"))
                     inflight_timed_out = (
                         sell_inflight
-                        and sell_retry_sec > 0
+                        and sell_inflight_timeout_sec > 0
                         and last_attempt
-                        and status_now - last_attempt >= sell_retry_sec
+                        and status_now - last_attempt >= sell_inflight_timeout_sec
                     )
                     if inflight_timed_out:
                         pending_updates.setdefault(
@@ -1554,18 +2340,13 @@ async def run_price_alerts(
                     name = entry.get("name") or "unknown"
                     symbol = entry.get("symbol") or "unknown"
                     if kind == "TRAILING_ARMED":
-                        print("")
-                        print(f"[ALERT] {ts_str} | TRAILING TP ARMED")
-                        print(f"wallet: {wallet}")
-                        print(f"token: {name}")
-                        print(f"ticker: {symbol}")
-                        print(f"CA: {mint}")
-                        print(f"buy price: {format_usd(buy_price)} USD")
-                        print(f"current price: {format_usd(price)} USD")
-                        print(
-                            f"trail start: {trailing_start_threshold}% "
-                            f"(drawdown {trailing_drawdown_threshold}%)"
+                        change_pct = ((price - buy_price) / buy_price * Decimal(100)).quantize(
+                            Decimal("0.01"), rounding=ROUND_HALF_UP
                         )
+                        print(
+                            f"[TRAIL] {ts_str} | {symbol} | armed at {change_pct:+f}%"
+                        )
+                        continue
 
             if status_updates:
                 ts_str = format_ts(time.time(), tz_offset_min)
@@ -1577,11 +2358,18 @@ async def run_price_alerts(
                         Decimal("0.01"), rounding=ROUND_HALF_UP
                     )
                     mcap_label = format_mcap_short(update.get("stop_mcap"))
-                    if mcap_label:
+                    current_label = format_mcap_short(update.get("current_mcap"))
+                    if mcap_label and current_label:
                         print(
                             f"[TRAIL] {ts_str} | {update['symbol']} | "
                             f"{change_pct:+f}% | sell at {stop_pct:+f}% | "
-                            f"mc {mcap_label}"
+                            f"mc now {current_label} | stop {mcap_label}"
+                        )
+                    elif mcap_label:
+                        print(
+                            f"[TRAIL] {ts_str} | {update['symbol']} | "
+                            f"{change_pct:+f}% | sell at {stop_pct:+f}% | "
+                            f"mc stop {mcap_label}"
                         )
                     else:
                         print(
@@ -1632,6 +2420,16 @@ async def run_price_alerts(
                             f"[SELL] {ts_str} | {candidate['symbol']} | "
                             f"{reason_label} | {change_pct:+f}% | sent"
                         )
+                        if sell_confirm_delay_sec > 0 and sell_ratio >= 1:
+                            async with price_lock:
+                                entry = price_watch.get(
+                                    (candidate["wallet"], candidate["mint"])
+                                )
+                                if entry:
+                                    entry["sell_confirm_attempts"] = 0
+                                    entry["sell_confirm_due"] = (
+                                        time.monotonic() + sell_confirm_delay_sec
+                                    )
                     except Exception as exc:
                         print("")
                         print(
@@ -1656,15 +2454,21 @@ async def run_price_alerts(
                                 else:
                                     entry["sell_inflight"] = False
 
-            next_sleep = poll_sec
+            next_sleep = effective_poll_sec
             if status_enabled and any(
                 entry.get("trailing_active") for entry in watch_snapshot.values()
             ):
-                next_sleep = min(poll_sec, trailing_status_sec)
+                next_sleep = max(
+                    next_sleep, min(poll_sec, trailing_status_sec)
+                )
         except asyncio.CancelledError:
             break
         except Exception as exc:
-            print(f"price alert error: {exc}")
+            msg = str(exc).strip()
+            if msg:
+                print(f"price alert error: {type(exc).__name__}: {msg}")
+            else:
+                print(f"price alert error: {type(exc).__name__}: {exc!r}")
             await asyncio.sleep(min(poll_sec, 30))
 
 
@@ -1732,6 +2536,7 @@ async def listen_for_trades(config: dict):
             trading_enabled_wallets.discard(wallet)
     ws_url = config["rpc_ws"]
     commitment = config.get("commitment", "confirmed")
+    commitment_fallback = False
     token_list_url = config.get("jupiter_tokens_url", JUPITER_TOKENS_URL_DEFAULT)
     price_url = config.get("price_url", PRICE_URL_DEFAULT)
     swap_url = config.get("swap_url", SWAP_URL_DEFAULT)
@@ -1739,8 +2544,10 @@ async def listen_for_trades(config: dict):
     trade_log_path = Path(config.get("trade_log_path", TRADE_LOG_PATH_DEFAULT))
     refresh_sec = int(config.get("jupiter_refresh_sec", JUPITER_REFRESH_SEC_DEFAULT))
     price_poll_sec = int(config.get("price_poll_sec", PRICE_POLL_SEC_DEFAULT))
-    drop_pct = parse_decimal(config.get("alert_drop_pct", ALERT_DROP_PCT_DEFAULT))
-    rise_pct = parse_decimal(config.get("alert_rise_pct", ALERT_RISE_PCT_DEFAULT))
+    price_max_rpm = int(config.get("price_max_rpm", PRICE_MAX_RPM_DEFAULT))
+    price_batch_size = int(
+        config.get("price_batch_size", PRICE_BATCH_SIZE_DEFAULT)
+    )
     trailing_start_pct = parse_decimal(
         config.get("trailing_start_pct", TRAILING_START_PCT_DEFAULT)
     )
@@ -1749,6 +2556,9 @@ async def listen_for_trades(config: dict):
     )
     trailing_status_sec = int(
         config.get("trailing_status_sec", TRAILING_STATUS_SEC_DEFAULT)
+    )
+    trailing_confirm_sec = int(
+        config.get("trailing_confirm_sec", TRAILING_CONFIRM_SEC_DEFAULT)
     )
     auto_sell_enabled = bool(
         config.get("auto_sell_enabled", AUTO_SELL_ENABLED_DEFAULT)
@@ -1774,11 +2584,24 @@ async def listen_for_trades(config: dict):
         config.get("sell_priority_fee_sol", SELL_PRIORITY_FEE_SOL_DEFAULT)
     )
     sell_retry_sec = int(config.get("sell_retry_sec", SELL_RETRY_SEC_DEFAULT))
+    sell_inflight_timeout_sec = int(
+        config.get("sell_inflight_timeout_sec", SELL_INFLIGHT_TIMEOUT_SEC_DEFAULT)
+    )
+    sell_confirm_delay_sec = int(
+        config.get("sell_confirm_delay_sec", SELL_CONFIRM_DELAY_SEC_DEFAULT)
+    )
+    sell_confirm_max_attempts = int(
+        config.get("sell_confirm_max_attempts", SELL_CONFIRM_MAX_ATTEMPTS_DEFAULT)
+    )
     trade_control_path = Path(
         config.get("trade_control_path", "trade_control.json")
     )
     trade_control_poll_sec = int(config.get("trade_control_poll_sec", 5))
+    price_watch_sync_sec = int(
+        config.get("price_watch_sync_sec", PRICE_WATCH_SYNC_SEC_DEFAULT)
+    )
     env_path = Path(config.get("env_path", ENV_PATH_DEFAULT))
+    load_env_file(env_path)
     keypair_env = config.get("keypair_env", KEYPAIR_ENV_DEFAULT)
     keypair_path = config.get("keypair_path")
     keypair_envs = resolve_alias_dict_keys(
@@ -1788,8 +2611,12 @@ async def listen_for_trades(config: dict):
         config.get("keypair_paths"), wallet_aliases
     )
     api_key_env = config.get("jupiter_api_key_env", "JUPITER_API_KEY")
-    drop_ratio = (drop_pct or ALERT_DROP_PCT_DEFAULT) / Decimal(100)
-    rise_ratio = (rise_pct or ALERT_RISE_PCT_DEFAULT) / Decimal(100)
+    webhook_url = config.get("discord_webhook_url")
+    webhook_env = config.get("discord_webhook_env", "DISCORD_WEBHOOK_URL")
+    webhook_send_buys = bool(config.get("webhook_send_buys", False))
+    webhook_send_sells = bool(config.get("webhook_send_sells", True))
+    if not webhook_url and webhook_env:
+        webhook_url = os.getenv(webhook_env)
     trailing_start_ratio = (
         (trailing_start_pct or TRAILING_START_PCT_DEFAULT) / Decimal(100)
     )
@@ -1823,7 +2650,6 @@ async def listen_for_trades(config: dict):
         and not stop_loss_ratios
     ):
         auto_sell_enabled = False
-    load_env_file(env_path)
     headers = config.get("jupiter_headers") or {}
     if not isinstance(headers, dict):
         headers = {}
@@ -1833,7 +2659,12 @@ async def listen_for_trades(config: dict):
 
     rpc = RpcClient(config["rpc_http"])
     token_cache = JupiterTokenCache(token_list_url, refresh_sec, headers)
-    price_client = JupiterPriceClient(price_url, headers)
+    price_client = JupiterPriceClient(
+        price_url, headers, batch_size=price_batch_size
+    )
+    webhook_client = None
+    if webhook_url:
+        webhook_client = httpx.AsyncClient(timeout=10)
     keypairs = {}
     if auto_sell_enabled:
         keypairs = load_keypairs(
@@ -1851,6 +2682,18 @@ async def listen_for_trades(config: dict):
     price_watch = load_price_watch(price_watch_path, set(wallets))
     price_lock = asyncio.Lock()
     seen = deque(maxlen=2000)
+    positions_live = {}
+    if trade_log_path and trade_log_path.exists():
+        entries = load_trade_log_entries(trade_log_path)
+        positions_live, _, _ = build_trade_log_index(entries)
+        positions_live = {
+            key: slot.get("buys") for key, slot in positions_live.items()
+        }
+        removed = sync_price_watch_with_log_entries(
+            price_watch, entries, price_watch_path
+        )
+        if removed:
+            print(f"price watch cleaned: {removed} stale entries removed")
 
     if price_watch:
         print(f"loaded {len(price_watch)} price watch entries")
@@ -1872,8 +2715,6 @@ async def listen_for_trades(config: dict):
                 price_watch,
                 price_lock,
                 price_watch_path,
-                drop_ratio,
-                rise_ratio,
                 price_poll_sec,
                 trailing_start_ratio,
                 trailing_drawdown_ratio,
@@ -1896,6 +2737,14 @@ async def listen_for_trades(config: dict):
                 trade_control_poll_sec,
                 wallet_aliases,
                 set(wallets),
+                trade_log_path,
+                price_watch_sync_sec,
+                price_max_rpm,
+                price_batch_size,
+                sell_inflight_timeout_sec,
+                trailing_confirm_sec,
+                sell_confirm_delay_sec,
+                sell_confirm_max_attempts,
             )
         )
 
@@ -1982,6 +2831,9 @@ async def listen_for_trades(config: dict):
                             for key in sell_keys:
                                 entry = price_watch.get(key)
                                 pnl_pct = None
+                                buy_sol_used_fallback = pop_open_position(
+                                    positions_live, key
+                                )
                                 if entry:
                                     buy_sol_used = entry.get("buy_sol_used")
                                     sol_received = sell_sol_received.get(key)
@@ -1991,6 +2843,16 @@ async def listen_for_trades(config: dict):
                                             / buy_sol_used
                                         ) * Decimal(100)
                                         sell_buy_sol_used[key] = buy_sol_used
+                                    elif buy_sol_used_fallback is not None:
+                                        sell_buy_sol_used[key] = buy_sol_used_fallback
+                                elif buy_sol_used_fallback is not None:
+                                    sell_buy_sol_used[key] = buy_sol_used_fallback
+                                    sol_received = sell_sol_received.get(key)
+                                    if sol_received is not None:
+                                        pnl_pct = (
+                                            (sol_received - buy_sol_used_fallback)
+                                            / buy_sol_used_fallback
+                                        ) * Decimal(100)
                                 sell_pnls[key] = pnl_pct
                                 price_watch.pop(key, None)
                             save_price_watch(price_watch_path, price_watch)
@@ -2001,6 +2863,10 @@ async def listen_for_trades(config: dict):
                         for trade in summary["trades"]:
                             if trade["side"] == "BUY":
                                 trade["sol_used"] = sol_used
+                                positions_live.setdefault(
+                                    (summary["wallet"], trade["mint"]),
+                                    deque(),
+                                ).append(sol_used)
                                 buy_requests.append((summary["wallet"], trade))
                     if buy_requests:
                         buy_mints = sorted({trade["mint"] for _, trade in buy_requests})
@@ -2018,8 +2884,6 @@ async def listen_for_trades(config: dict):
                                         continue
                                     price_watch[(wallet, mint)] = {
                                         "buy_price": price,
-                                        "alerted_down": False,
-                                        "alerted_up": False,
                                         "trailing_active": False,
                                         "trailing_peak": None,
                                         "buy_sol_used": trade.get("sol_used"),
@@ -2037,6 +2901,21 @@ async def listen_for_trades(config: dict):
                                 trade["pnl_pct"] = sell_pnls.get(key)
                                 trade["buy_sol_used"] = sell_buy_sol_used.get(key)
                         print_trade_summary(summary, trade_log_path, tz_offset_min)
+                        if webhook_url and webhook_client:
+                            for trade in summary["trades"]:
+                                side = trade.get("side")
+                                if side == "BUY" and not webhook_send_buys:
+                                    continue
+                                if side == "SELL" and not webhook_send_sells:
+                                    continue
+                                message = format_trade_message(
+                                    summary, trade, tz_offset_min
+                                )
+                                asyncio.create_task(
+                                    send_discord_webhook(
+                                        webhook_client, webhook_url, message
+                                    )
+                                )
 
                 for msg in pending:
                     await handle_message(msg)
@@ -2045,6 +2924,23 @@ async def listen_for_trades(config: dict):
                     msg = json.loads(raw)
                     await handle_message(msg)
         except (websockets.WebSocketException, httpx.HTTPError, RuntimeError) as exc:
+            err = exc
+            err_payload = err.args[0] if err.args else None
+            msg = ""
+            if isinstance(err_payload, dict):
+                msg = str(err_payload.get("message", ""))
+            else:
+                msg = str(err)
+            if (
+                "commitment below" in msg.lower()
+                and "confirmed" in msg.lower()
+                and not commitment_fallback
+            ):
+                commitment = "confirmed"
+                commitment_fallback = True
+                print(
+                    "commitment rejected by RPC, falling back to confirmed"
+                )
             print(f"connection error: {exc}. reconnecting in {backoff}s")
             await asyncio.sleep(backoff)
             backoff = min(backoff * 2, 30)
@@ -2061,6 +2957,8 @@ async def listen_for_trades(config: dict):
         price_task.cancel()
     await token_cache.close()
     await price_client.close()
+    if webhook_client:
+        await webhook_client.aclose()
     if swap_client:
         await swap_client.close()
     await rpc.close()
@@ -2164,6 +3062,1076 @@ def main():
             print(f"Trade log not found: {log_path}")
             return
         print_trade_stats(log_path, since, until, tz_offset_min)
+        return
+
+    if len(sys.argv) > 1 and sys.argv[1] == "backfill":
+        args = sys.argv[2:]
+        config_path = Path("config.json")
+        wallet_arg = None
+        mint_arg = None
+        limit = 200
+        since = None
+        dry_run = False
+        rpc_override = None
+        i = 0
+        while i < len(args):
+            arg = args[i]
+            if arg == "--wallet" and i + 1 < len(args):
+                wallet_arg = args[i + 1]
+                i += 2
+                continue
+            if arg == "--mint" and i + 1 < len(args):
+                mint_arg = args[i + 1]
+                i += 2
+                continue
+            if arg == "--limit" and i + 1 < len(args):
+                limit = int(args[i + 1])
+                i += 2
+                continue
+            if arg == "--since" and i + 1 < len(args):
+                duration = parse_duration(args[i + 1])
+                if duration is None:
+                    since = parse_datetime_value(args[i + 1], TZ_OFFSET_MINUTES_DEFAULT)
+                else:
+                    since = int(time.time()) - duration
+                i += 2
+                continue
+            if arg == "--config" and i + 1 < len(args):
+                config_path = Path(args[i + 1])
+                i += 2
+                continue
+            if arg in ("--rpc", "--rpc-http") and i + 1 < len(args):
+                rpc_override = args[i + 1]
+                i += 2
+                continue
+            if arg == "--dry-run":
+                dry_run = True
+                i += 1
+                continue
+            i += 1
+
+        if not wallet_arg or not mint_arg:
+            print("Usage: bot.py backfill --wallet <alias|address> --mint <mint> [--limit N] [--since <time>] [--dry-run]")
+            return
+
+        config = {}
+        if config_path.exists():
+            try:
+                config = load_config(config_path)
+            except Exception:
+                config = {}
+        wallet_aliases = config.get("wallet_aliases") or {}
+        if not isinstance(wallet_aliases, dict):
+            wallet_aliases = {}
+        wallet = wallet_aliases.get(wallet_arg, wallet_arg)
+        rpc_http = rpc_override or config.get("rpc_http_backfill") or config.get("rpc_http")
+        commitment = config.get("commitment", "confirmed")
+        log_path = Path(
+            config.get("trade_log_path", TRADE_LOG_PATH_DEFAULT)
+            if isinstance(config, dict)
+            else TRADE_LOG_PATH_DEFAULT
+        )
+        watch_path = Path(
+            config.get("price_watch_path", PRICE_WATCH_PATH_DEFAULT)
+            if isinstance(config, dict)
+            else PRICE_WATCH_PATH_DEFAULT
+        )
+        watch_path = Path(
+            config.get("price_watch_path", PRICE_WATCH_PATH_DEFAULT)
+            if isinstance(config, dict)
+            else PRICE_WATCH_PATH_DEFAULT
+        )
+        tz_offset_min = int(
+            config.get("tz_offset_minutes", TZ_OFFSET_MINUTES_DEFAULT)
+            if isinstance(config, dict)
+            else TZ_OFFSET_MINUTES_DEFAULT
+        )
+        if not rpc_http:
+            print("Missing rpc_http in config.")
+            return
+        if not log_path.exists():
+            print(f"Trade log not found: {log_path}")
+            return
+
+        entries = load_trade_log_entries(log_path)
+        positions, sell_sigs, meta = build_trade_log_index(entries)
+        logged_sell_sigs = sell_sigs.get((wallet, mint_arg), set())
+        meta_slot = meta.get((wallet, mint_arg), {})
+        meta_name = meta_slot.get("name")
+        meta_symbol = meta_slot.get("symbol")
+        meta_mcap = meta_slot.get("marketcap")
+        last_buy_ts = None
+        open_slot = positions.get((wallet, mint_arg))
+        if open_slot:
+            for buy in open_slot.get("buys", []):
+                ts_val = buy.get("ts")
+                if ts_val:
+                    last_buy_ts = max(last_buy_ts or 0, int(ts_val))
+
+        if since is None:
+            since = last_buy_ts
+        elif last_buy_ts:
+            since = max(since, last_buy_ts)
+
+        async def run_backfill():
+            rpc = RpcClient(rpc_http)
+            new_entries = await collect_missing_sell_entries(
+                rpc=rpc,
+                wallet=wallet,
+                mint=mint_arg,
+                commitment=commitment,
+                since=since,
+                limit=limit,
+                logged_sell_sigs=logged_sell_sigs,
+                meta_name=meta_name,
+                meta_symbol=meta_symbol,
+                meta_mcap=meta_mcap,
+            )
+            await rpc.close()
+
+            if not new_entries:
+                print("No missing sell entries found.")
+                return
+
+            new_entries.sort(key=log_entry_ts)
+            print(f"Backfill candidates: {len(new_entries)}")
+            for entry in new_entries:
+                ts_str = format_ts(entry.get("ts"), tz_offset_min)
+                print(
+                    f"- {entry.get('signature')} | {entry.get('mint')} | "
+                    f"{entry.get('sol_received')} SOL | {ts_str}"
+                )
+
+            if dry_run:
+                return
+
+            entries.extend(new_entries)
+            entries.sort(key=log_entry_ts)
+            if not write_trade_log_entries(log_path, entries):
+                print("Trade log not updated (write failed).")
+                return
+            print(f"Trade log updated: {log_path}")
+            removed = sync_price_watch_with_log(watch_path, entries)
+            if removed:
+                print(f"Price watch cleaned: {removed} stale entries removed")
+
+        asyncio.run(run_backfill())
+        return
+
+    if len(sys.argv) > 1 and sys.argv[1] == "backfill-buy":
+        args = sys.argv[2:]
+        config_path = Path("config.json")
+        wallet_arg = None
+        mint_arg = None
+        limit = 200
+        since = None
+        dry_run = False
+        rpc_override = None
+        i = 0
+        while i < len(args):
+            arg = args[i]
+            if arg == "--wallet" and i + 1 < len(args):
+                wallet_arg = args[i + 1]
+                i += 2
+                continue
+            if arg == "--mint" and i + 1 < len(args):
+                mint_arg = args[i + 1]
+                i += 2
+                continue
+            if arg == "--limit" and i + 1 < len(args):
+                limit = int(args[i + 1])
+                i += 2
+                continue
+            if arg == "--since" and i + 1 < len(args):
+                duration = parse_duration(args[i + 1])
+                if duration is None:
+                    since = parse_datetime_value(args[i + 1], TZ_OFFSET_MINUTES_DEFAULT)
+                else:
+                    since = int(time.time()) - duration
+                i += 2
+                continue
+            if arg == "--config" and i + 1 < len(args):
+                config_path = Path(args[i + 1])
+                i += 2
+                continue
+            if arg in ("--rpc", "--rpc-http") and i + 1 < len(args):
+                rpc_override = args[i + 1]
+                i += 2
+                continue
+            if arg == "--dry-run":
+                dry_run = True
+                i += 1
+                continue
+            i += 1
+
+        if not wallet_arg or not mint_arg:
+            print("Usage: bot.py backfill-buy --wallet <alias|address> --mint <mint> [--limit N] [--since <time>] [--dry-run]")
+            return
+
+        config = {}
+        if config_path.exists():
+            try:
+                config = load_config(config_path)
+            except Exception:
+                config = {}
+        wallet_aliases = config.get("wallet_aliases") or {}
+        if not isinstance(wallet_aliases, dict):
+            wallet_aliases = {}
+        wallet = wallet_aliases.get(wallet_arg, wallet_arg)
+        rpc_http = rpc_override or config.get("rpc_http_backfill") or config.get("rpc_http")
+        commitment = config.get("commitment", "confirmed")
+        log_path = Path(
+            config.get("trade_log_path", TRADE_LOG_PATH_DEFAULT)
+            if isinstance(config, dict)
+            else TRADE_LOG_PATH_DEFAULT
+        )
+        watch_path = Path(
+            config.get("price_watch_path", PRICE_WATCH_PATH_DEFAULT)
+            if isinstance(config, dict)
+            else PRICE_WATCH_PATH_DEFAULT
+        )
+        price_url = config.get("price_url", PRICE_URL_DEFAULT)
+        price_batch_size = int(
+            config.get("price_batch_size", PRICE_BATCH_SIZE_DEFAULT)
+            if isinstance(config, dict)
+            else PRICE_BATCH_SIZE_DEFAULT
+        )
+        env_path = Path(config.get("env_path", ENV_PATH_DEFAULT))
+        api_key_env = config.get("jupiter_api_key_env", "JUPITER_API_KEY")
+        if not rpc_http:
+            print("Missing rpc_http in config.")
+            return
+        if not log_path.exists():
+            print(f"Trade log not found: {log_path}")
+            return
+
+        load_env_file(env_path)
+        headers = config.get("jupiter_headers") or {}
+        if not isinstance(headers, dict):
+            headers = {}
+        env_api_key = os.getenv(api_key_env) if api_key_env else None
+        if env_api_key and not headers.get("x-api-key"):
+            headers["x-api-key"] = env_api_key
+
+        entries = load_trade_log_entries(log_path)
+        positions, sell_sigs, meta = build_trade_log_index(entries)
+        logged_buy_sigs = set()
+        for entry in entries:
+            if entry.get("side") == "BUY" and entry.get("wallet") == wallet and entry.get("mint") == mint_arg:
+                sig = entry.get("signature")
+                if sig:
+                    logged_buy_sigs.add(sig)
+        meta_slot = meta.get((wallet, mint_arg), {})
+        meta_name = meta_slot.get("name")
+        meta_symbol = meta_slot.get("symbol")
+        meta_mcap = meta_slot.get("marketcap")
+
+        async def run_backfill_buy():
+            rpc = RpcClient(rpc_http)
+            new_entries = await collect_missing_buy_entries(
+                rpc=rpc,
+                wallet=wallet,
+                mint=mint_arg,
+                commitment=commitment,
+                since=since,
+                limit=limit,
+                logged_buy_sigs=logged_buy_sigs,
+                meta_name=meta_name,
+                meta_symbol=meta_symbol,
+                meta_mcap=meta_mcap,
+            )
+            await rpc.close()
+
+            if not new_entries:
+                print("No missing buy entries found.")
+                return
+
+            new_entries.sort(key=log_entry_ts)
+            print(f"Backfill candidates: {len(new_entries)}")
+            for entry in new_entries:
+                ts_str = format_ts(entry.get("ts"), TZ_OFFSET_MINUTES_DEFAULT)
+                print(
+                    f"- {entry.get('wallet')} | {entry.get('mint')} | "
+                    f"{entry.get('sol_used')} SOL | {ts_str}"
+                )
+
+            if dry_run:
+                return
+
+            entries.extend(new_entries)
+            entries.sort(key=log_entry_ts)
+            if not write_trade_log_entries(log_path, entries):
+                print("Trade log not updated (write failed).")
+                return
+            print(f"Trade log updated: {log_path}")
+
+            price_client = JupiterPriceClient(
+                price_url, headers, batch_size=price_batch_size
+            )
+            prices = await price_client.fetch_prices([mint_arg])
+            await price_client.close()
+            price = prices.get(mint_arg)
+            if price is None:
+                print("Price watch not updated: no price available")
+                return
+
+            watch = load_price_watch(watch_path, set())
+            newest = max(new_entries, key=log_entry_ts)
+            buy_sol_used = parse_decimal(newest.get("sol_used"))
+            watch[(wallet, mint_arg)] = {
+                "buy_price": price,
+                "trailing_active": False,
+                "trailing_peak": None,
+                "trailing_below_since": None,
+                "buy_sol_used": buy_sol_used,
+                "name": meta_name or "unknown",
+                "symbol": meta_symbol or "unknown",
+                "marketcap": parse_decimal(meta_mcap),
+            }
+            save_price_watch(watch_path, watch)
+            print("Price watch updated from backfill (current price).")
+
+        asyncio.run(run_backfill_buy())
+        return
+
+    if len(sys.argv) > 1 and sys.argv[1] == "recent-buys":
+        args = sys.argv[2:]
+        config_path = Path("config.json")
+        wallet_arg = None
+        limit = 50
+        since = None
+        rpc_override = None
+        i = 0
+        while i < len(args):
+            arg = args[i]
+            if arg == "--wallet" and i + 1 < len(args):
+                wallet_arg = args[i + 1]
+                i += 2
+                continue
+            if arg == "--limit" and i + 1 < len(args):
+                limit = int(args[i + 1])
+                i += 2
+                continue
+            if arg == "--since" and i + 1 < len(args):
+                duration = parse_duration(args[i + 1])
+                if duration is None:
+                    since = parse_datetime_value(args[i + 1], TZ_OFFSET_MINUTES_DEFAULT)
+                else:
+                    since = int(time.time()) - duration
+                i += 2
+                continue
+            if arg == "--config" and i + 1 < len(args):
+                config_path = Path(args[i + 1])
+                i += 2
+                continue
+            if arg in ("--rpc", "--rpc-http") and i + 1 < len(args):
+                rpc_override = args[i + 1]
+                i += 2
+                continue
+            i += 1
+
+        if not wallet_arg:
+            print("Usage: bot.py recent-buys --wallet <alias|address> [--limit N] [--since <time>]")
+            return
+
+        config = {}
+        if config_path.exists():
+            try:
+                config = load_config(config_path)
+            except Exception:
+                config = {}
+        wallet_aliases = config.get("wallet_aliases") or {}
+        if not isinstance(wallet_aliases, dict):
+            wallet_aliases = {}
+        wallet = wallet_aliases.get(wallet_arg, wallet_arg)
+        rpc_http = rpc_override or config.get("rpc_http_backfill") or config.get("rpc_http")
+        commitment = config.get("commitment", "confirmed")
+        token_list_url = config.get("jupiter_tokens_url", JUPITER_TOKENS_URL_DEFAULT)
+        refresh_sec = int(config.get("jupiter_refresh_sec", JUPITER_REFRESH_SEC_DEFAULT))
+        tz_offset_min = int(
+            config.get("tz_offset_minutes", TZ_OFFSET_MINUTES_DEFAULT)
+            if isinstance(config, dict)
+            else TZ_OFFSET_MINUTES_DEFAULT
+        )
+        env_path = Path(config.get("env_path", ENV_PATH_DEFAULT))
+        api_key_env = config.get("jupiter_api_key_env", "JUPITER_API_KEY")
+
+        if not rpc_http:
+            print("Missing rpc_http in config.")
+            return
+
+        load_env_file(env_path)
+        headers = config.get("jupiter_headers") or {}
+        if not isinstance(headers, dict):
+            headers = {}
+        env_api_key = os.getenv(api_key_env) if api_key_env else None
+        if env_api_key and not headers.get("x-api-key"):
+            headers["x-api-key"] = env_api_key
+
+        async def run_recent_buys():
+            rpc = RpcClient(rpc_http)
+            token_cache = JupiterTokenCache(token_list_url, refresh_sec, headers)
+            results = []
+            before = None
+            remaining = max(1, limit * 5)
+            stop = False
+            while remaining > 0 and not stop:
+                try:
+                    batch = await fetch_signatures_for_address(
+                        rpc,
+                        wallet,
+                        limit=min(1000, remaining),
+                        before=before,
+                    )
+                except httpx.HTTPError as exc:
+                    print(f"RPC error fetching signatures for {wallet}: {exc}")
+                    break
+                if not batch:
+                    break
+                for sig_info in batch:
+                    sig = sig_info.get("signature")
+                    if not sig:
+                        continue
+                    block_time = sig_info.get("blockTime")
+                    if since and block_time and block_time < since:
+                        stop = True
+                        break
+                    try:
+                        tx = await fetch_transaction(rpc, sig, commitment)
+                    except httpx.HTTPError as exc:
+                        print(f"RPC error fetching transaction {sig}: {exc}")
+                        continue
+                    if not tx:
+                        continue
+                    summary = summarize_trades(
+                        signature=sig,
+                        slot=tx.get("slot") or sig_info.get("slot") or 0,
+                        block_time=tx.get("blockTime") or block_time or 0,
+                        wallet=wallet,
+                        tx=tx,
+                    )
+                    if not summary:
+                        continue
+                    buys = [t for t in summary.get("trades", []) if t.get("side") == "BUY"]
+                    if not buys:
+                        continue
+                    mints = [t.get("mint") for t in buys if t.get("mint")]
+                    if mints:
+                        try:
+                            await token_cache.ensure(mints)
+                        except Exception:
+                            pass
+                    sol_used = max(-summary.get("sol_change", Decimal(0)), Decimal(0))
+                    for trade in buys:
+                        mint = trade.get("mint")
+                        meta = token_cache.get(mint) or {}
+                        name = meta.get("name") or trade.get("name") or "unknown"
+                        symbol = meta.get("symbol") or trade.get("symbol") or "unknown"
+                        results.append(
+                            {
+                                "ts": summary.get("block_time"),
+                                "signature": summary.get("signature"),
+                                "mint": mint,
+                                "name": name,
+                                "symbol": symbol,
+                                "sol_used": sol_used,
+                            }
+                        )
+                        if len(results) >= limit:
+                            stop = True
+                            break
+                    if stop:
+                        break
+                before = batch[-1].get("signature")
+                remaining -= len(batch)
+
+            await token_cache.close()
+            await rpc.close()
+
+            if not results:
+                print("No recent buys found.")
+                return
+
+            results.sort(key=lambda item: item["ts"] or 0, reverse=True)
+            print(f"Recent buys for {wallet}:")
+            for item in results:
+                ts_str = format_ts(item.get("ts"), tz_offset_min)
+                print(
+                    f"- {item['symbol']} | {item['name']} | {item['mint']} | "
+                    f"{item['sol_used']:.9f} SOL | {ts_str} | {item['signature']}"
+                )
+
+        asyncio.run(run_recent_buys())
+        return
+
+    if len(sys.argv) > 1 and sys.argv[1] == "backfill-buys":
+        args = sys.argv[2:]
+        config_path = Path("config.json")
+        wallet_arg = None
+        limit = 50
+        since = None
+        dry_run = False
+        rpc_override = None
+        i = 0
+        while i < len(args):
+            arg = args[i]
+            if arg == "--wallet" and i + 1 < len(args):
+                wallet_arg = args[i + 1]
+                i += 2
+                continue
+            if arg == "--limit" and i + 1 < len(args):
+                limit = int(args[i + 1])
+                i += 2
+                continue
+            if arg == "--since" and i + 1 < len(args):
+                duration = parse_duration(args[i + 1])
+                if duration is None:
+                    since = parse_datetime_value(args[i + 1], TZ_OFFSET_MINUTES_DEFAULT)
+                else:
+                    since = int(time.time()) - duration
+                i += 2
+                continue
+            if arg == "--config" and i + 1 < len(args):
+                config_path = Path(args[i + 1])
+                i += 2
+                continue
+            if arg in ("--rpc", "--rpc-http") and i + 1 < len(args):
+                rpc_override = args[i + 1]
+                i += 2
+                continue
+            if arg == "--dry-run":
+                dry_run = True
+                i += 1
+                continue
+            i += 1
+
+        config = {}
+        if config_path.exists():
+            try:
+                config = load_config(config_path)
+            except Exception:
+                config = {}
+        wallet_aliases = config.get("wallet_aliases") or {}
+        if not isinstance(wallet_aliases, dict):
+            wallet_aliases = {}
+        wallets = normalize_wallets(config, wallet_aliases)
+        if wallet_arg:
+            wallets = [wallet_aliases.get(wallet_arg, wallet_arg)]
+        rpc_http = rpc_override or config.get("rpc_http_backfill") or config.get("rpc_http")
+        commitment = config.get("commitment", "confirmed")
+        token_list_url = config.get("jupiter_tokens_url", JUPITER_TOKENS_URL_DEFAULT)
+        refresh_sec = int(config.get("jupiter_refresh_sec", JUPITER_REFRESH_SEC_DEFAULT))
+        log_path = Path(
+            config.get("trade_log_path", TRADE_LOG_PATH_DEFAULT)
+            if isinstance(config, dict)
+            else TRADE_LOG_PATH_DEFAULT
+        )
+        watch_path = Path(
+            config.get("price_watch_path", PRICE_WATCH_PATH_DEFAULT)
+            if isinstance(config, dict)
+            else PRICE_WATCH_PATH_DEFAULT
+        )
+        price_url = config.get("price_url", PRICE_URL_DEFAULT)
+        price_batch_size = int(
+            config.get("price_batch_size", PRICE_BATCH_SIZE_DEFAULT)
+            if isinstance(config, dict)
+            else PRICE_BATCH_SIZE_DEFAULT
+        )
+        env_path = Path(config.get("env_path", ENV_PATH_DEFAULT))
+        api_key_env = config.get("jupiter_api_key_env", "JUPITER_API_KEY")
+        tz_offset_min = int(
+            config.get("tz_offset_minutes", TZ_OFFSET_MINUTES_DEFAULT)
+            if isinstance(config, dict)
+            else TZ_OFFSET_MINUTES_DEFAULT
+        )
+
+        if not wallets:
+            print("No wallets configured.")
+            return
+        if not rpc_http:
+            print("Missing rpc_http in config.")
+            return
+        if not log_path.exists():
+            print(f"Trade log not found: {log_path}")
+            return
+
+        load_env_file(env_path)
+        headers = config.get("jupiter_headers") or {}
+        if not isinstance(headers, dict):
+            headers = {}
+        env_api_key = os.getenv(api_key_env) if api_key_env else None
+        if env_api_key and not headers.get("x-api-key"):
+            headers["x-api-key"] = env_api_key
+
+        entries = load_trade_log_entries(log_path)
+        logged_buy_keys = set()
+        for entry in entries:
+            if entry.get("side") == "BUY":
+                sig = entry.get("signature")
+                mint = entry.get("mint")
+                wallet = entry.get("wallet")
+                if sig and mint and wallet:
+                    logged_buy_keys.add((wallet, sig, mint))
+
+        async def run_backfill_buys():
+            rpc = RpcClient(rpc_http)
+            token_cache = JupiterTokenCache(token_list_url, refresh_sec, headers)
+            new_entries = []
+            for wallet in wallets:
+                batch_entries = await collect_missing_buys_for_wallet(
+                    rpc=rpc,
+                    token_cache=token_cache,
+                    wallet=wallet,
+                    commitment=commitment,
+                    since=since,
+                    limit=limit,
+                    logged_buy_keys=logged_buy_keys,
+                )
+                if batch_entries:
+                    new_entries.extend(batch_entries)
+            await token_cache.close()
+            await rpc.close()
+
+            if not new_entries:
+                print("No missing buy entries found.")
+                return
+
+            new_entries.sort(key=log_entry_ts)
+            print(f"Backfill candidates: {len(new_entries)}")
+            for entry in new_entries:
+                ts_str = format_ts(entry.get("ts"), tz_offset_min)
+                print(
+                    f"- {entry.get('wallet')} | {entry.get('symbol')} | "
+                    f"{entry.get('mint')} | {entry.get('sol_used')} SOL | {ts_str}"
+                )
+
+            if dry_run:
+                return
+
+            entries.extend(new_entries)
+            entries.sort(key=log_entry_ts)
+            if not write_trade_log_entries(log_path, entries):
+                print("Trade log not updated (write failed).")
+                return
+            print(f"Trade log updated: {log_path}")
+
+            positions, _, meta = build_trade_log_index(entries)
+            watch = load_price_watch(watch_path, set())
+            missing_keys = [key for key in positions.keys() if key not in watch]
+            if not missing_keys:
+                return
+            price_client = JupiterPriceClient(
+                price_url, headers, batch_size=price_batch_size
+            )
+            mints = sorted({mint for (_, mint) in missing_keys})
+            prices = await price_client.fetch_prices(mints)
+            await price_client.close()
+            for (wallet, mint) in missing_keys:
+                price = prices.get(mint)
+                if price is None:
+                    continue
+                buys = positions.get((wallet, mint), {}).get("buys") or deque()
+                if not buys:
+                    continue
+                last_buy = buys[-1]
+                buy_sol_used = parse_decimal(last_buy.get("sol_used"))
+                meta_slot = meta.get((wallet, mint), {})
+                watch[(wallet, mint)] = {
+                    "buy_price": price,
+                    "trailing_active": False,
+                    "trailing_peak": None,
+                    "trailing_below_since": None,
+                    "buy_sol_used": buy_sol_used,
+                    "name": meta_slot.get("name") or "unknown",
+                    "symbol": meta_slot.get("symbol") or "unknown",
+                    "marketcap": parse_decimal(meta_slot.get("marketcap")),
+                }
+            save_price_watch(watch_path, watch)
+            print("Price watch updated from backfill (current prices).")
+
+        asyncio.run(run_backfill_buys())
+        return
+
+    if len(sys.argv) > 1 and sys.argv[1] == "rebuild-trade-log":
+        args = sys.argv[2:]
+        config_path = Path("config.json")
+        wallet_arg = None
+        since = None
+        limit = 1000
+        dry_run = False
+        rpc_override = None
+        rebuild_watch = True
+        i = 0
+        while i < len(args):
+            arg = args[i]
+            if arg == "--wallet" and i + 1 < len(args):
+                wallet_arg = args[i + 1]
+                i += 2
+                continue
+            if arg == "--since" and i + 1 < len(args):
+                duration = parse_duration(args[i + 1])
+                if duration is None:
+                    since = parse_datetime_value(args[i + 1], TZ_OFFSET_MINUTES_DEFAULT)
+                else:
+                    since = int(time.time()) - duration
+                i += 2
+                continue
+            if arg == "--limit" and i + 1 < len(args):
+                limit = int(args[i + 1])
+                i += 2
+                continue
+            if arg == "--config" and i + 1 < len(args):
+                config_path = Path(args[i + 1])
+                i += 2
+                continue
+            if arg in ("--rpc", "--rpc-http") and i + 1 < len(args):
+                rpc_override = args[i + 1]
+                i += 2
+                continue
+            if arg == "--no-watch":
+                rebuild_watch = False
+                i += 1
+                continue
+            if arg == "--dry-run":
+                dry_run = True
+                i += 1
+                continue
+            i += 1
+
+        config = {}
+        if config_path.exists():
+            try:
+                config = load_config(config_path)
+            except Exception:
+                config = {}
+        wallet_aliases = config.get("wallet_aliases") or {}
+        if not isinstance(wallet_aliases, dict):
+            wallet_aliases = {}
+        wallets = normalize_wallets(config, wallet_aliases)
+        if wallet_arg:
+            wallets = [wallet_aliases.get(wallet_arg, wallet_arg)]
+        rpc_http = rpc_override or config.get("rpc_http_backfill") or config.get("rpc_http")
+        commitment = config.get("commitment", "confirmed")
+        token_list_url = config.get("jupiter_tokens_url", JUPITER_TOKENS_URL_DEFAULT)
+        refresh_sec = int(config.get("jupiter_refresh_sec", JUPITER_REFRESH_SEC_DEFAULT))
+        log_path = Path(
+            config.get("trade_log_path", TRADE_LOG_PATH_DEFAULT)
+            if isinstance(config, dict)
+            else TRADE_LOG_PATH_DEFAULT
+        )
+        watch_path = Path(
+            config.get("price_watch_path", PRICE_WATCH_PATH_DEFAULT)
+            if isinstance(config, dict)
+            else PRICE_WATCH_PATH_DEFAULT
+        )
+        price_url = config.get("price_url", PRICE_URL_DEFAULT)
+        price_batch_size = int(
+            config.get("price_batch_size", PRICE_BATCH_SIZE_DEFAULT)
+            if isinstance(config, dict)
+            else PRICE_BATCH_SIZE_DEFAULT
+        )
+        env_path = Path(config.get("env_path", ENV_PATH_DEFAULT))
+        api_key_env = config.get("jupiter_api_key_env", "JUPITER_API_KEY")
+
+        if not wallets:
+            print("No wallets configured.")
+            return
+        if not rpc_http:
+            print("Missing rpc_http in config.")
+            return
+
+        load_env_file(env_path)
+        headers = config.get("jupiter_headers") or {}
+        if not isinstance(headers, dict):
+            headers = {}
+        env_api_key = os.getenv(api_key_env) if api_key_env else None
+        if env_api_key and not headers.get("x-api-key"):
+            headers["x-api-key"] = env_api_key
+
+        async def run_rebuild():
+            rpc = RpcClient(rpc_http)
+            token_cache = JupiterTokenCache(token_list_url, refresh_sec, headers)
+            new_entries = await rebuild_trade_log_from_chain(
+                rpc=rpc,
+                token_cache=token_cache,
+                wallets=wallets,
+                commitment=commitment,
+                since=since,
+                limit=limit,
+            )
+            await token_cache.close()
+            await rpc.close()
+
+            if not new_entries:
+                print("No trades found for rebuild.")
+                return
+
+            new_entries.sort(key=log_entry_ts)
+            print(f"Rebuild candidates: {len(new_entries)}")
+            if dry_run:
+                return
+
+            if not write_trade_log_entries(log_path, new_entries):
+                print("Trade log not updated (write failed).")
+                return
+            print(f"Trade log rebuilt: {log_path}")
+
+            if not rebuild_watch:
+                return
+
+            positions, _, meta = build_trade_log_index(new_entries)
+            price_client = JupiterPriceClient(
+                price_url, headers, batch_size=price_batch_size
+            )
+            mints = sorted({mint for (_, mint) in positions.keys()})
+            prices = await price_client.fetch_prices(mints)
+            await price_client.close()
+            watch = {}
+            for (wallet, mint), data in positions.items():
+                price = prices.get(mint)
+                if price is None:
+                    continue
+                buys = data.get("buys") or deque()
+                if not buys:
+                    continue
+                last_buy = buys[-1]
+                buy_sol_used = parse_decimal(last_buy.get("sol_used"))
+                meta_slot = meta.get((wallet, mint), {})
+                watch[(wallet, mint)] = {
+                    "buy_price": price,
+                    "trailing_active": False,
+                    "trailing_peak": None,
+                    "trailing_below_since": None,
+                    "buy_sol_used": buy_sol_used,
+                    "name": meta_slot.get("name") or "unknown",
+                    "symbol": meta_slot.get("symbol") or "unknown",
+                    "marketcap": parse_decimal(meta_slot.get("marketcap")),
+                }
+            save_price_watch(watch_path, watch)
+            print("Price watch rebuilt from open positions (current prices).")
+
+        asyncio.run(run_rebuild())
+        return
+
+    if len(sys.argv) > 1 and sys.argv[1] == "webhook-test":
+        args = sys.argv[2:]
+        config_path = Path("config.json")
+        message = "SolBot webhook test"
+        i = 0
+        while i < len(args):
+            arg = args[i]
+            if arg == "--config" and i + 1 < len(args):
+                config_path = Path(args[i + 1])
+                i += 2
+                continue
+            if arg == "--message" and i + 1 < len(args):
+                message = args[i + 1]
+                i += 2
+                continue
+            i += 1
+
+        config = {}
+        if config_path.exists():
+            try:
+                config = load_config(config_path)
+            except Exception:
+                config = {}
+
+        env_path = Path(config.get("env_path", ENV_PATH_DEFAULT))
+        load_env_file(env_path)
+        webhook_url = config.get("discord_webhook_url")
+        webhook_env = config.get("discord_webhook_env", "DISCORD_WEBHOOK_URL")
+        if not webhook_url and webhook_env:
+            webhook_url = os.getenv(webhook_env)
+        if not webhook_url:
+            print("No webhook URL configured.")
+            return
+
+        async def run_webhook_test():
+            client = httpx.AsyncClient(timeout=10)
+            await send_discord_webhook(client, webhook_url, message)
+            await client.aclose()
+            print("Webhook test sent.")
+
+        asyncio.run(run_webhook_test())
+        return
+
+    if len(sys.argv) > 1 and sys.argv[1] == "backfill-open":
+        args = sys.argv[2:]
+        config_path = Path("config.json")
+        limit = 200
+        since = None
+        dry_run = False
+        rpc_override = None
+        i = 0
+        while i < len(args):
+            arg = args[i]
+            if arg == "--limit" and i + 1 < len(args):
+                limit = int(args[i + 1])
+                i += 2
+                continue
+            if arg == "--since" and i + 1 < len(args):
+                duration = parse_duration(args[i + 1])
+                if duration is None:
+                    since = parse_datetime_value(args[i + 1], TZ_OFFSET_MINUTES_DEFAULT)
+                else:
+                    since = int(time.time()) - duration
+                i += 2
+                continue
+            if arg == "--config" and i + 1 < len(args):
+                config_path = Path(args[i + 1])
+                i += 2
+                continue
+            if arg in ("--rpc", "--rpc-http") and i + 1 < len(args):
+                rpc_override = args[i + 1]
+                i += 2
+                continue
+            if arg == "--dry-run":
+                dry_run = True
+                i += 1
+                continue
+            i += 1
+
+        config = {}
+        if config_path.exists():
+            try:
+                config = load_config(config_path)
+            except Exception:
+                config = {}
+        rpc_http = rpc_override or config.get("rpc_http_backfill") or config.get("rpc_http")
+        commitment = config.get("commitment", "confirmed")
+        log_path = Path(
+            config.get("trade_log_path", TRADE_LOG_PATH_DEFAULT)
+            if isinstance(config, dict)
+            else TRADE_LOG_PATH_DEFAULT
+        )
+        tz_offset_min = int(
+            config.get("tz_offset_minutes", TZ_OFFSET_MINUTES_DEFAULT)
+            if isinstance(config, dict)
+            else TZ_OFFSET_MINUTES_DEFAULT
+        )
+        if not rpc_http:
+            print("Missing rpc_http in config.")
+            return
+        if not log_path.exists():
+            print(f"Trade log not found: {log_path}")
+            return
+
+        entries = load_trade_log_entries(log_path)
+        positions, sell_sigs, meta = build_trade_log_index(entries)
+        if not positions:
+            print("No open positions found in trade log.")
+            return
+
+        async def run_backfill_open():
+            rpc = RpcClient(rpc_http)
+            new_entries = []
+            for (wallet, mint), data in positions.items():
+                last_buy_ts = None
+                for buy in data.get("buys", []):
+                    ts_val = buy.get("ts")
+                    if ts_val:
+                        last_buy_ts = max(last_buy_ts or 0, int(ts_val))
+                since_for_key = last_buy_ts
+                if since is not None:
+                    since_for_key = max(since or 0, since_for_key or 0) or since_for_key
+                meta_slot = meta.get((wallet, mint), {})
+                batch_entries = await collect_missing_sell_entries(
+                    rpc=rpc,
+                    wallet=wallet,
+                    mint=mint,
+                    commitment=commitment,
+                    since=since_for_key,
+                    limit=limit,
+                    logged_sell_sigs=sell_sigs.get((wallet, mint), set()),
+                    meta_name=meta_slot.get("name"),
+                    meta_symbol=meta_slot.get("symbol"),
+                    meta_mcap=meta_slot.get("marketcap"),
+                )
+                if batch_entries:
+                    new_entries.extend(batch_entries)
+            await rpc.close()
+
+            if not new_entries:
+                print("No missing sell entries found.")
+                return
+
+            new_entries.sort(key=log_entry_ts)
+            print(f"Backfill candidates: {len(new_entries)}")
+            for entry in new_entries:
+                ts_str = format_ts(entry.get("ts"), tz_offset_min)
+                print(
+                    f"- {entry.get('wallet')} | {entry.get('mint')} | "
+                    f"{entry.get('sol_received')} SOL | {ts_str}"
+                )
+
+            if dry_run:
+                return
+
+            entries.extend(new_entries)
+            entries.sort(key=log_entry_ts)
+            if not write_trade_log_entries(log_path, entries):
+                print("Trade log not updated (write failed).")
+                return
+            print(f"Trade log updated: {log_path}")
+
+        asyncio.run(run_backfill_open())
+        return
+
+    if len(sys.argv) > 1 and sys.argv[1] == "positions":
+        args = sys.argv[2:]
+        config_path = Path("config.json")
+        log_path = None
+        watch_path = None
+        tz_offset_min = TZ_OFFSET_MINUTES_DEFAULT
+        i = 0
+        while i < len(args):
+            arg = args[i]
+            if arg == "--config" and i + 1 < len(args):
+                config_path = Path(args[i + 1])
+                i += 2
+                continue
+            if arg in ("--log", "--log-path") and i + 1 < len(args):
+                log_path = Path(args[i + 1])
+                i += 2
+                continue
+            if arg in ("--watch", "--watch-path") and i + 1 < len(args):
+                watch_path = Path(args[i + 1])
+                i += 2
+                continue
+            if arg == "--tz" and i + 1 < len(args):
+                tz_offset_min = int(args[i + 1])
+                i += 2
+                continue
+            i += 1
+
+        config = {}
+        if config_path.exists():
+            try:
+                config = load_config(config_path)
+            except Exception:
+                config = {}
+        if log_path is None:
+            log_path = Path(
+                config.get("trade_log_path", TRADE_LOG_PATH_DEFAULT)
+                if isinstance(config, dict)
+                else TRADE_LOG_PATH_DEFAULT
+            )
+        if watch_path is None:
+            watch_path = Path(
+                config.get("price_watch_path", PRICE_WATCH_PATH_DEFAULT)
+                if isinstance(config, dict)
+                else PRICE_WATCH_PATH_DEFAULT
+            )
+        if tz_offset_min == TZ_OFFSET_MINUTES_DEFAULT and isinstance(config, dict):
+            tz_offset_min = int(
+                config.get("tz_offset_minutes", TZ_OFFSET_MINUTES_DEFAULT)
+            )
+
+        if not log_path.exists():
+            print(f"Trade log not found: {log_path}")
+            return
+        print_open_positions(log_path, tz_offset_min, watch_path)
         return
 
     config_path = Path(sys.argv[1]) if len(sys.argv) > 1 else Path("config.json")
