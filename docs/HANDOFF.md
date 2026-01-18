@@ -3,23 +3,29 @@
 Update this file when you stop working so the next session can pick up quickly.
 
 ## Current State
-- Bot tracks multiple wallets via `wallets` in config, shows wallet in output.
-- BUY/SELL lines use green/red circle emoji (TTY only).
-- Output includes post-transaction SOL balance.
-- Price alerts: records BUY price via Jupiter Price API V3 and alerts on -10%/+20%.
-- Price watch persists to `price_watch.json`; cleared on SELL and on trailing TP trigger.
-- Trailing TP alerts: arms at +20% gain, tracks peak, triggers on 10% drawdown.
+- Bot tracks multiple wallets; trade output reordered and simplified.
+- BUY/SELL trade lines use green/red circle emoji; SELL blocks include PnL with emoji.
+- Trailing TP: arms at +20%, tracks peak, triggers on 10% drawdown.
+- Trailing status logs show current % and sell trigger %; include estimated MC at stop.
+- Stop-loss auto-sells with two levels (-10%, -15%) and retries until success; inflight auto-clears after `sell_retry_sec`.
+- Price watch persists to `price_watch.json` and only clears on on-chain SELL detection; if sell fails with balance zero, entry is removed and logged.
+- Auto-sell uses Jupiter Ultra (`/ultra/v1/order` + `/execute`) and Ultra holdings for balance.
+- Multi-wallet auto-sell supported via `keypair_envs` mapping; per-wallet trading can be toggled via `trade_control.json`.
+- Drawdown monitor logs `[LOSS]` at -5% (configurable).
+- README updated with `.env`, wallet aliases, trade control, stats usage, and timezone notes.
 
 ## Decisions / Context
 - Price API V3 used for alerts (Ultra is swap execution, not price feed).
-- Config additions: `price_url`, `price_poll_sec`, `price_watch_path`, `alert_*`, `trailing_*`.
-- Current `config.example.json` contains real values (wallets + API key) and `.gitignore` is empty by user choice.
+- Swap path is Jupiter Ultra; API key read from `.env` via `jupiter_api_key_env`.
+- `.env` added and ignored in `.gitignore`.
+- `config.example.json` now uses placeholders and documents new sell/stop-loss fields.
 
 ## Next Steps
-1) Restart bot and verify trailing TP alerts with a live trade.
-2) Update `config.json` with `trailing_start_pct`/`trailing_drawdown_pct` if needed.
-3) Optionally re-add `.gitignore` entries for `config.json` and `price_watch.json` before pushing.
+1) Ensure `keypair_envs` covers wallets that should auto-sell.
+2) Verify stop-loss + trailing TP behavior with live trades.
+3) Adjust `drawdown_status_*` / `stop_loss_levels_pct` as needed.
 
 ## Issues / Risks
-- Python compile check failed due to `python` not on PATH; use `py -3.14 -m py_compile bot.py` if needed.
-- With `.gitignore` empty, secrets in `config.json` will be pushed to GitHub.
+- RPC 403s were observed; Ultra holdings now used for sell balance, but RPC is still used for tx parsing.
+- `config.json` may still contain secrets; `.env` is now ignored but `config.json` is not.
+- Review feedback pending: per-sell PnL uses tx SOL delta (bad for multi-sell tx); `stats --tz` arg order parsing bug.

@@ -1,9 +1,15 @@
 {
-  "wallets": [
-    "8BfDa8gQ8qv1x2r4p5Z6u7y8a9b0cD1e2f3G4h5J6k7",
-    "H3kL9mN2pQ4rS6tU8vW1xY3zA5bC7dE9fG1hJ3kL5mN",
-	"BM16WbBV5vWsqW7WC4nXEUm1yLaiM1Hia2f4jB9a8ZWr"
-  ],
+  "wallet_aliases": {
+    "main": "8BfDa8gQ8qv1x2r4p5Z6u7y8a9b0cD1e2f3G4h5J6k7",
+    "alt": "H3kL9mN2pQ4rS6tU8vW1xY3zA5bC7dE9fG1hJ3kL5mN",
+    "cold": "BM16WbBV5vWsqW7WC4nXEUm1yLaiM1Hia2f4jB9a8ZWr"
+  },
+  "wallets": ["main", "alt", "cold"],
+  "wallet_trading_enabled": {
+    "main": true,
+    "alt": false,
+    "cold": false
+  },
   "rpc_http": "https://solana-mainnet.core.chainstack.com/3bf3dd4cdc8ad586a34ea105adbad9a2",
   "rpc_ws": "wss://solana-mainnet.core.chainstack.com/3bf3dd4cdc8ad586a34ea105adbad9a2",
   "commitment": "confirmed",
@@ -13,6 +19,7 @@
   "swap_url": "https://api.jup.ag/ultra/v1",
   "price_poll_sec": 30,
   "price_watch_path": "price_watch.json",
+  "trade_log_path": "trade_log.jsonl",
   "alert_drop_pct": 10,
   "alert_rise_pct": 20,
   "trailing_start_pct": 20,
@@ -23,15 +30,19 @@
   "stop_loss_levels_pct": [10, 15],
   "drawdown_status_pct": 5,
   "drawdown_status_sec": 5,
+  "tz_offset_minutes": 570,
   "sell_pct": 100,
   "sell_slippage_pct": 30,
   "sell_priority_fee_sol": 0.001,
   "sell_retry_sec": 30,
+  "trade_control_path": "trade_control.json",
+  "trade_control_poll_sec": 5,
   "env_path": ".env",
   "keypair_env": "SOLANA_KEYPAIR",
   "keypair_envs": {
-    "8BfDa8gQ8qv1x2r4p5Z6u7y8a9b0cD1e2f3G4h5J6k7": "SOLANA_KEYPAIR_1",
-    "H3kL9mN2pQ4rS6tU8vW1xY3zA5bC7dE9fG1hJ3kL5mN": "SOLANA_KEYPAIR_2"
+    "main": "SOLANA_KEYPAIR_1",
+    "alt": "SOLANA_KEYPAIR_2",
+    "cold": "SOLANA_KEYPAIR_3"
   },
   "jupiter_api_key_env": "JUPITER_API_KEY",
   "jupiter_headers": {}

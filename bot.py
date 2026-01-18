@@ -4,6 +4,8 @@ import json
 import os
 import sys
 import time
+from datetime import datetime, timedelta, timezone
+import re
 from collections import deque
 from decimal import Decimal, ROUND_HALF_UP, ROUND_DOWN, getcontext
 from pathlib import Path
@@ -42,6 +44,8 @@ AUTO_SELL_ENABLED_DEFAULT = False
 ENV_PATH_DEFAULT = ".env"
 KEYPAIR_ENV_DEFAULT = "SOLANA_KEYPAIR"
 PRICE_WATCH_PATH_DEFAULT = "price_watch.json"
+TRADE_LOG_PATH_DEFAULT = "trade_log.jsonl"
+TZ_OFFSET_MINUTES_DEFAULT = 570
 GREEN_CIRCLE = "\U0001F7E2"
 RED_CIRCLE = "\U0001F534"
 WSOL_MINT = "So11111111111111111111111111111111111111112"
@@ -49,6 +53,196 @@ WSOL_MINT = "So11111111111111111111111111111111111111112"
 
 def trend_icon(change: Decimal) -> str:
     return GREEN_CIRCLE if change >= 0 else RED_CIRCLE
+
+
+def resolve_alias_dict_keys(mapping, alias_map: dict) -> dict:
+    if not isinstance(mapping, dict):
+        return {}
+    alias_map = alias_map or {}
+    resolved = {}
+    for key, value in mapping.items():
+        resolved_key = alias_map.get(key, key)
+        resolved[resolved_key] = value
+    return resolved
+
+
+def format_ts(epoch_sec: int | float | None, offset_min: int) -> str:
+    if not epoch_sec:
+        return "unknown-time"
+    tz = timezone(timedelta(minutes=offset_min))
+    dt = datetime.fromtimestamp(float(epoch_sec), tz=tz)
+    return dt.strftime("%Y-%m-%d %H:%M:%S")
+
+
+def append_trade_log(path: Path, entry: dict):
+    try:
+        if path.parent and not path.parent.exists():
+            path.parent.mkdir(parents=True, exist_ok=True)
+        with path.open("a", encoding="utf-8") as f:
+            f.write(json.dumps(entry, ensure_ascii=True) + "\n")
+    except Exception as exc:
+        print(f"trade log write error: {exc}")
+
+
+def load_trade_controls(
+    path: Path, alias_map: dict, tracked_wallets: set[str] | None = None
+):
+    if not path.exists():
+        return {}
+    try:
+        raw = json.loads(path.read_text(encoding="utf-8"))
+    except Exception:
+        return {}
+    mapping = raw.get("wallet_trading_enabled", raw) if isinstance(raw, dict) else raw
+    if not isinstance(mapping, dict):
+        return {}
+    resolved = resolve_alias_dict_keys(mapping, alias_map)
+    if tracked_wallets:
+        resolved = {k: v for k, v in resolved.items() if k in tracked_wallets}
+    return {k: bool(v) for k, v in resolved.items()}
+
+
+def write_trade_controls(path: Path, mapping: dict):
+    payload = {
+        "updated_ts": int(time.time()),
+        "wallet_trading_enabled": mapping,
+    }
+    try:
+        if path.parent and not path.parent.exists():
+            path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(
+            json.dumps(payload, indent=2, ensure_ascii=True),
+            encoding="utf-8",
+        )
+    except Exception as exc:
+        print(f"trade control write error: {exc}")
+
+
+def parse_duration(value: str) -> int | None:
+    match = re.match(r"^(\d+)([smhd])$", value.strip().lower())
+    if not match:
+        return None
+    amount = int(match.group(1))
+    unit = match.group(2)
+    if unit == "s":
+        return amount
+    if unit == "m":
+        return amount * 60
+    if unit == "h":
+        return amount * 3600
+    if unit == "d":
+        return amount * 86400
+    return None
+
+
+def parse_datetime_value(value: str, tz_offset_min: int) -> int | None:
+    try:
+        dt = datetime.fromisoformat(value)
+    except ValueError:
+        return None
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone(timedelta(minutes=tz_offset_min)))
+    return int(dt.timestamp())
+
+
+def iter_trade_log(path: Path):
+    if not path.exists():
+        return
+    with path.open("r", encoding="utf-8") as f:
+        for line in f:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                yield json.loads(line)
+            except json.JSONDecodeError:
+                continue
+
+
+def print_trade_stats(
+    log_path: Path, since: int | None, until: int | None, tz_offset_min: int
+):
+    total = 0
+    buys = 0
+    sells = 0
+    sol_spent = Decimal(0)
+    sol_received = Decimal(0)
+    pnl_sum = Decimal(0)
+    wins = 0
+    losses = 0
+    wallets = set()
+    tokens = set()
+    positions_all = {}
+
+    for entry in iter_trade_log(log_path):
+        ts = entry.get("ts") or entry.get("detected_ts")
+        if not ts:
+            continue
+        ts = int(ts)
+        if until and ts > until:
+            continue
+        wallet = entry.get("wallet")
+        mint = entry.get("mint")
+        side = entry.get("side")
+        key = (wallet, mint) if wallet and mint else None
+        buy_used = None
+
+        if side == "BUY":
+            sol_used = parse_decimal(entry.get("sol_used"))
+            if sol_used is not None and key:
+                positions_all.setdefault(key, deque()).append(sol_used)
+        elif side == "SELL":
+            if key:
+                stack = positions_all.get(key)
+                if stack:
+                    buy_used = stack.popleft()
+            if buy_used is None:
+                buy_used = parse_decimal(entry.get("buy_sol_used"))
+
+        if since and ts < since:
+            continue
+        total += 1
+        if side == "BUY":
+            buys += 1
+        elif side == "SELL":
+            sells += 1
+            sol_recv = parse_decimal(entry.get("sol_received"))
+            if sol_recv is not None and buy_used is not None:
+                sol_received += sol_recv
+                sol_spent += buy_used
+            pnl_pct = parse_decimal(entry.get("pnl_pct"))
+            if pnl_pct is not None:
+                pnl_sum += pnl_pct
+                if pnl_pct > 0:
+                    wins += 1
+                elif pnl_pct < 0:
+                    losses += 1
+        if wallet:
+            wallets.add(wallet)
+        if mint:
+            tokens.add(mint)
+
+    if total == 0:
+        print("No trades found for the selected period.")
+        return
+
+    net_sol = sol_received - sol_spent
+    open_positions = sum(len(stack) for stack in positions_all.values())
+    start_str = format_ts(since, tz_offset_min) if since else "all-time"
+    end_str = format_ts(until, tz_offset_min) if until else "now"
+
+    print(f"Period: {start_str} -> {end_str}")
+    print(f"Trades: {total} (buys {buys}, sells {sells})")
+    print(f"Wallets: {len(wallets)} | Tokens: {len(tokens)}")
+    print(f"SOL spent: {sol_spent:.9f}")
+    print(f"SOL received: {sol_received:.9f}")
+    print(f"Net SOL: {net_sol:.9f}")
+    if sol_spent > 0:
+        total_pct = (net_sol / sol_spent) * Decimal(100)
+        total_fmt = total_pct.quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
+        print(f"Total PnL (net): {total_fmt:+f}%")
+    print(f"Open positions: {open_positions}")
+    print(f"Win/Loss (sells): {wins}/{losses}")
 
 
 def load_env_file(path: Path):
@@ -290,6 +484,11 @@ def serialize_price_watch(price_watch: dict) -> dict:
                     if entry.get("trailing_peak") is not None
                     else None
                 ),
+                "buy_sol_used": (
+                    str(entry.get("buy_sol_used"))
+                    if entry.get("buy_sol_used") is not None
+                    else None
+                ),
                 "name": entry.get("name"),
                 "symbol": entry.get("symbol"),
                 "marketcap": (
@@ -337,6 +536,7 @@ def load_price_watch(path: Path, wallets: set[str]) -> dict:
             "alerted_up": bool(entry.get("alerted_up", False)),
             "trailing_active": bool(entry.get("trailing_active", False)),
             "trailing_peak": parse_decimal(entry.get("trailing_peak")),
+            "buy_sol_used": parse_decimal(entry.get("buy_sol_used")),
             "name": entry.get("name"),
             "symbol": entry.get("symbol"),
             "marketcap": parse_decimal(entry.get("marketcap")),
@@ -829,12 +1029,11 @@ def summarize_trades(signature: str, slot: int, block_time: int, wallet: str, tx
     }
 
 
-def print_trade_summary(summary: dict):
+def print_trade_summary(
+    summary: dict, trade_log_path: Path | None, tz_offset_min: int
+):
     ts = summary["block_time"]
-    if ts:
-        ts_str = time.strftime("%Y-%m-%d %H:%M:%S", time.gmtime(ts))
-    else:
-        ts_str = "unknown-time"
+    ts_str = format_ts(ts, tz_offset_min)
 
     sol_balance_post = summary.get("sol_balance")
 
@@ -873,6 +1072,58 @@ def print_trade_summary(summary: dict):
             print(f"wallet sol balance: {sol_balance_post:.9f} SOL")
         print(f"timestamp: {ts_str} | slot {summary['slot']}")
 
+        if trade_log_path:
+            amount_ui = format_amount(trade["amount_raw"], trade["decimals"])
+            entry = {
+                "ts": ts,
+                "detected_ts": int(time.time()),
+                "signature": summary.get("signature"),
+                "slot": summary.get("slot"),
+                "wallet": summary.get("wallet"),
+                "side": trade.get("side"),
+                "mint": trade.get("mint"),
+                "name": trade.get("name"),
+                "symbol": trade.get("symbol"),
+                "marketcap": (
+                    str(trade.get("marketcap"))
+                    if trade.get("marketcap") is not None
+                    else None
+                ),
+                "amount_raw": trade.get("amount_raw"),
+                "decimals": trade.get("decimals"),
+                "amount_ui": amount_ui,
+                "sol_change": str(summary.get("sol_change"))
+                if summary.get("sol_change") is not None
+                else None,
+                "sol_used": str(sol_used) if trade["side"] == "BUY" else None,
+                "sol_received": str(sol_received)
+                if trade["side"] == "SELL"
+                else None,
+                "buy_sol_used": (
+                    str(trade.get("buy_sol_used"))
+                    if trade.get("buy_sol_used") is not None
+                    else (
+                        str(trade.get("sol_used"))
+                        if trade.get("sol_used") is not None
+                        else None
+                    )
+                ),
+                "sol_balance": str(sol_balance_post)
+                if sol_balance_post is not None
+                else None,
+                "buy_price": (
+                    str(trade.get("buy_price"))
+                    if trade.get("buy_price") is not None
+                    else None
+                ),
+                "pnl_pct": (
+                    str(trade.get("pnl_pct"))
+                    if trade.get("pnl_pct") is not None
+                    else None
+                ),
+            }
+            append_trade_log(trade_log_path, entry)
+
 
 async def run_price_alerts(
     price_client,
@@ -897,6 +1148,12 @@ async def run_price_alerts(
     swap_client: "UltraSwapClient | None",
     rpc: "RpcClient | None",
     keypairs: dict,
+    tz_offset_min: int,
+    trading_enabled_wallets: set[str],
+    trade_control_path: Path | None,
+    trade_control_poll_sec: int,
+    wallet_aliases: dict,
+    tracked_wallets: set[str],
 ):
     if poll_sec <= 0:
         return
@@ -930,21 +1187,53 @@ async def run_price_alerts(
         auto_sell_enabled = False
     last_status = {}
     last_drawdown_status = {}
+    control_overrides = {}
+    last_control_check = 0.0
+    last_control_mtime = None
+    base_trading_enabled_wallets = set(trading_enabled_wallets)
     next_sleep = poll_sec
     while True:
         try:
             await asyncio.sleep(next_sleep)
+            if trade_control_path and trade_control_poll_sec > 0:
+                now = time.monotonic()
+                if now - last_control_check >= trade_control_poll_sec:
+                    last_control_check = now
+                    try:
+                        if trade_control_path.exists():
+                            mtime = trade_control_path.stat().st_mtime
+                            if mtime != last_control_mtime:
+                                control_overrides = load_trade_controls(
+                                    trade_control_path,
+                                    wallet_aliases,
+                                    tracked_wallets,
+                                )
+                                last_control_mtime = mtime
+                        else:
+                            if last_control_mtime is not None:
+                                control_overrides = {}
+                                last_control_mtime = None
+                    except Exception:
+                        pass
+            trading_enabled_wallets = set(base_trading_enabled_wallets)
+            if control_overrides:
+                for wallet, enabled in control_overrides.items():
+                    if enabled:
+                        trading_enabled_wallets.add(wallet)
+                    else:
+                        trading_enabled_wallets.discard(wallet)
             async with price_lock:
                 watch_snapshot = {
                     key: {
                         "buy_price": entry.get("buy_price"),
                         "alerted_down": entry.get("alerted_down", False),
                         "alerted_up": entry.get("alerted_up", False),
-                        "trailing_active": entry.get("trailing_active", False),
+                    "trailing_active": entry.get("trailing_active", False),
                     "trailing_peak": entry.get("trailing_peak"),
                     "name": entry.get("name"),
                     "symbol": entry.get("symbol"),
                     "marketcap": entry.get("marketcap"),
+                    "buy_sol_used": entry.get("buy_sol_used"),
                     "sell_inflight": entry.get("sell_inflight", False),
                     "sell_last_attempt": entry.get("sell_last_attempt", 0),
                     "sell_last_reason": entry.get("sell_last_reason"),
@@ -1150,9 +1439,24 @@ async def run_price_alerts(
                         or is_stop_loss
                     )
                     skip_reason = None
-                    if wallet not in keypairs:
+                    sell_inflight = bool(entry.get("sell_inflight"))
+                    inflight_timed_out = (
+                        sell_inflight
+                        and sell_retry_sec > 0
+                        and last_attempt
+                        and status_now - last_attempt >= sell_retry_sec
+                    )
+                    if inflight_timed_out:
+                        pending_updates.setdefault(
+                            key, {"buy_price": buy_price, "changes": {}}
+                        )["changes"]["sell_inflight"] = False
+                        sell_inflight = False
+
+                    if wallet not in trading_enabled_wallets:
+                        skip_reason = "trading_disabled"
+                    elif wallet not in keypairs:
                         skip_reason = "missing_keypair"
-                    elif entry.get("sell_inflight"):
+                    elif sell_inflight:
                         skip_reason = "sell_inflight"
                     elif not cooldown_ok:
                         skip_reason = "cooldown"
@@ -1239,7 +1543,7 @@ async def run_price_alerts(
                     last_drawdown_status.pop(key, None)
 
             if alerts:
-                ts_str = time.strftime("%Y-%m-%d %H:%M:%S", time.gmtime())
+                ts_str = format_ts(time.time(), tz_offset_min)
                 for alert in alerts:
                     kind = alert["type"]
                     wallet = alert["wallet"]
@@ -1264,7 +1568,7 @@ async def run_price_alerts(
                         )
 
             if status_updates:
-                ts_str = time.strftime("%Y-%m-%d %H:%M:%S", time.gmtime())
+                ts_str = format_ts(time.time(), tz_offset_min)
                 for update in status_updates:
                     change_pct = (update["change"] * Decimal(100)).quantize(
                         Decimal("0.01"), rounding=ROUND_HALF_UP
@@ -1286,7 +1590,7 @@ async def run_price_alerts(
                         )
 
             if drawdown_updates:
-                ts_str = time.strftime("%Y-%m-%d %H:%M:%S", time.gmtime())
+                ts_str = format_ts(time.time(), tz_offset_min)
                 for update in drawdown_updates:
                     change_pct = (update["change"] * Decimal(100)).quantize(
                         Decimal("0.01"), rounding=ROUND_HALF_UP
@@ -1295,7 +1599,7 @@ async def run_price_alerts(
 
             if sell_candidates and swap_client and rpc and keypairs:
                 for candidate in sell_candidates:
-                    ts_str = time.strftime("%Y-%m-%d %H:%M:%S", time.gmtime())
+                    ts_str = format_ts(time.time(), tz_offset_min)
                     change_pct = (candidate["change"] * Decimal(100)).quantize(
                         Decimal("0.01"), rounding=ROUND_HALF_UP
                     )
@@ -1339,7 +1643,18 @@ async def run_price_alerts(
                                 (candidate["wallet"], candidate["mint"])
                             )
                             if entry:
-                                entry["sell_inflight"] = False
+                                if "token balance is zero" in str(exc).lower():
+                                    price_watch.pop(
+                                        (candidate["wallet"], candidate["mint"]),
+                                        None,
+                                    )
+                                    save_price_watch(price_watch_path, price_watch)
+                                    print(
+                                        f"[WARN] {ts_str} | {candidate['symbol']} | "
+                                        "removed from price watch (balance zero)"
+                                    )
+                                else:
+                                    entry["sell_inflight"] = False
 
             next_sleep = poll_sec
             if status_enabled and any(
@@ -1353,7 +1668,8 @@ async def run_price_alerts(
             await asyncio.sleep(min(poll_sec, 30))
 
 
-def normalize_wallets(config: dict) -> list[str]:
+def normalize_wallets(config: dict, alias_map: dict | None = None) -> list[str]:
+    alias_map = alias_map or {}
     wallets = config.get("wallets")
     if wallets is None:
         wallet = config.get("wallet")
@@ -1362,7 +1678,12 @@ def normalize_wallets(config: dict) -> list[str]:
         wallets = [wallets]
     else:
         wallets = [w for w in wallets if w]
-    return wallets
+    resolved = []
+    for wallet in wallets:
+        if not wallet:
+            continue
+        resolved.append(alias_map.get(wallet, wallet))
+    return list(dict.fromkeys(resolved))
 
 
 async def subscribe_wallets(ws, wallets: list[str], commitment: str):
@@ -1398,13 +1719,24 @@ async def subscribe_wallets(ws, wallets: list[str], commitment: str):
 
 
 async def listen_for_trades(config: dict):
-    wallets = normalize_wallets(config)
+    wallet_aliases = config.get("wallet_aliases") or {}
+    if not isinstance(wallet_aliases, dict):
+        wallet_aliases = {}
+    wallets = normalize_wallets(config, wallet_aliases)
+    wallet_trading_enabled = resolve_alias_dict_keys(
+        config.get("wallet_trading_enabled") or {}, wallet_aliases
+    )
+    trading_enabled_wallets = set(wallets)
+    for wallet, enabled in wallet_trading_enabled.items():
+        if wallet in trading_enabled_wallets and not bool(enabled):
+            trading_enabled_wallets.discard(wallet)
     ws_url = config["rpc_ws"]
     commitment = config.get("commitment", "confirmed")
     token_list_url = config.get("jupiter_tokens_url", JUPITER_TOKENS_URL_DEFAULT)
     price_url = config.get("price_url", PRICE_URL_DEFAULT)
     swap_url = config.get("swap_url", SWAP_URL_DEFAULT)
     price_watch_path = Path(config.get("price_watch_path", PRICE_WATCH_PATH_DEFAULT))
+    trade_log_path = Path(config.get("trade_log_path", TRADE_LOG_PATH_DEFAULT))
     refresh_sec = int(config.get("jupiter_refresh_sec", JUPITER_REFRESH_SEC_DEFAULT))
     price_poll_sec = int(config.get("price_poll_sec", PRICE_POLL_SEC_DEFAULT))
     drop_pct = parse_decimal(config.get("alert_drop_pct", ALERT_DROP_PCT_DEFAULT))
@@ -1433,6 +1765,7 @@ async def listen_for_trades(config: dict):
     drawdown_status_sec = int(
         config.get("drawdown_status_sec", DRAW_DOWN_STATUS_SEC_DEFAULT)
     )
+    tz_offset_min = int(config.get("tz_offset_minutes", TZ_OFFSET_MINUTES_DEFAULT))
     sell_pct = parse_decimal(config.get("sell_pct", SELL_PCT_DEFAULT))
     sell_slippage_pct = parse_decimal(
         config.get("sell_slippage_pct", SELL_SLIPPAGE_PCT_DEFAULT)
@@ -1441,11 +1774,19 @@ async def listen_for_trades(config: dict):
         config.get("sell_priority_fee_sol", SELL_PRIORITY_FEE_SOL_DEFAULT)
     )
     sell_retry_sec = int(config.get("sell_retry_sec", SELL_RETRY_SEC_DEFAULT))
+    trade_control_path = Path(
+        config.get("trade_control_path", "trade_control.json")
+    )
+    trade_control_poll_sec = int(config.get("trade_control_poll_sec", 5))
     env_path = Path(config.get("env_path", ENV_PATH_DEFAULT))
     keypair_env = config.get("keypair_env", KEYPAIR_ENV_DEFAULT)
     keypair_path = config.get("keypair_path")
-    keypair_envs = config.get("keypair_envs")
-    keypair_paths = config.get("keypair_paths")
+    keypair_envs = resolve_alias_dict_keys(
+        config.get("keypair_envs"), wallet_aliases
+    )
+    keypair_paths = resolve_alias_dict_keys(
+        config.get("keypair_paths"), wallet_aliases
+    )
     api_key_env = config.get("jupiter_api_key_env", "JUPITER_API_KEY")
     drop_ratio = (drop_pct or ALERT_DROP_PCT_DEFAULT) / Decimal(100)
     rise_ratio = (rise_pct or ALERT_RISE_PCT_DEFAULT) / Decimal(100)
@@ -1549,6 +1890,12 @@ async def listen_for_trades(config: dict):
                 swap_client,
                 rpc,
                 keypairs,
+                tz_offset_min,
+                trading_enabled_wallets,
+                trade_control_path,
+                trade_control_poll_sec,
+                wallet_aliases,
+                set(wallets),
             )
         )
 
@@ -1620,30 +1967,40 @@ async def listen_for_trades(config: dict):
 
                     sell_keys = []
                     sell_pnls = {}
+                    sell_sol_received = {}
+                    sell_buy_sol_used = {}
                     for summary in summaries:
                         for trade in summary["trades"]:
                             if trade["side"] == "SELL":
-                                sell_keys.append((summary["wallet"], trade["mint"]))
+                                key = (summary["wallet"], trade["mint"])
+                                sell_keys.append(key)
+                                sell_sol_received[key] = max(
+                                    summary["sol_change"], Decimal(0)
+                                )
                     if sell_keys:
                         async with price_lock:
                             for key in sell_keys:
                                 entry = price_watch.get(key)
                                 pnl_pct = None
                                 if entry:
-                                    buy_price = entry.get("buy_price")
-                                    last_price = entry.get("last_price")
-                                    if buy_price and last_price:
+                                    buy_sol_used = entry.get("buy_sol_used")
+                                    sol_received = sell_sol_received.get(key)
+                                    if buy_sol_used and sol_received is not None:
                                         pnl_pct = (
-                                            (last_price - buy_price) / buy_price
+                                            (sol_received - buy_sol_used)
+                                            / buy_sol_used
                                         ) * Decimal(100)
+                                        sell_buy_sol_used[key] = buy_sol_used
                                 sell_pnls[key] = pnl_pct
                                 price_watch.pop(key, None)
                             save_price_watch(price_watch_path, price_watch)
 
                     buy_requests = []
                     for summary in summaries:
+                        sol_used = max(-summary["sol_change"], Decimal(0))
                         for trade in summary["trades"]:
                             if trade["side"] == "BUY":
+                                trade["sol_used"] = sol_used
                                 buy_requests.append((summary["wallet"], trade))
                     if buy_requests:
                         buy_mints = sorted({trade["mint"] for _, trade in buy_requests})
@@ -1665,10 +2022,12 @@ async def listen_for_trades(config: dict):
                                         "alerted_up": False,
                                         "trailing_active": False,
                                         "trailing_peak": None,
+                                        "buy_sol_used": trade.get("sol_used"),
                                         "name": trade.get("name"),
                                         "symbol": trade.get("symbol"),
                                         "marketcap": trade.get("marketcap"),
                                     }
+                                    trade["buy_price"] = price
                                 save_price_watch(price_watch_path, price_watch)
 
                     for summary in summaries:
@@ -1676,7 +2035,8 @@ async def listen_for_trades(config: dict):
                             if trade["side"] == "SELL":
                                 key = (summary["wallet"], trade["mint"])
                                 trade["pnl_pct"] = sell_pnls.get(key)
-                        print_trade_summary(summary)
+                                trade["buy_sol_used"] = sell_buy_sol_used.get(key)
+                        print_trade_summary(summary, trade_log_path, tz_offset_min)
 
                 for msg in pending:
                     await handle_message(msg)
@@ -1707,6 +2067,105 @@ async def listen_for_trades(config: dict):
 
 
 def main():
+    if len(sys.argv) > 1 and sys.argv[1] == "trading":
+        args = sys.argv[2:]
+        wallet_arg = None
+        state = None
+        config_path = Path("config.json")
+        control_path = None
+        i = 0
+        while i < len(args):
+            arg = args[i]
+            if arg == "--wallet" and i + 1 < len(args):
+                wallet_arg = args[i + 1]
+                i += 2
+                continue
+            if arg == "--on":
+                state = True
+                i += 1
+                continue
+            if arg == "--off":
+                state = False
+                i += 1
+                continue
+            if arg == "--config" and i + 1 < len(args):
+                config_path = Path(args[i + 1])
+                i += 2
+                continue
+            if arg in ("--control", "--control-path") and i + 1 < len(args):
+                control_path = Path(args[i + 1])
+                i += 2
+                continue
+            i += 1
+
+        if wallet_arg is None or state is None:
+            print("Usage: bot.py trading --wallet <alias|address> --on|--off")
+            return
+
+        config = {}
+        if config_path.exists():
+            try:
+                config = load_config(config_path)
+            except Exception:
+                config = {}
+        wallet_aliases = config.get("wallet_aliases") or {}
+        if not isinstance(wallet_aliases, dict):
+            wallet_aliases = {}
+        resolved_wallet = wallet_aliases.get(wallet_arg, wallet_arg)
+        if control_path is None:
+            control_path = Path(
+                config.get("trade_control_path", "trade_control.json")
+                if isinstance(config, dict)
+                else "trade_control.json"
+            )
+
+        current = load_trade_controls(control_path, wallet_aliases)
+        current[resolved_wallet] = state
+        write_trade_controls(control_path, current)
+        status = "enabled" if state else "disabled"
+        print(f"Trading {status} for {resolved_wallet}")
+        return
+
+    if len(sys.argv) > 1 and sys.argv[1] == "stats":
+        args = sys.argv[2:]
+        log_path = Path(TRADE_LOG_PATH_DEFAULT)
+        since = None
+        until = None
+        tz_offset_min = TZ_OFFSET_MINUTES_DEFAULT
+        i = 0
+        while i < len(args):
+            arg = args[i]
+            if arg in ("--log", "--log-path") and i + 1 < len(args):
+                log_path = Path(args[i + 1])
+                i += 2
+                continue
+            if arg == "--since" and i + 1 < len(args):
+                duration = parse_duration(args[i + 1])
+                if duration is None:
+                    since = parse_datetime_value(args[i + 1], tz_offset_min)
+                else:
+                    since = int(time.time()) - duration
+                i += 2
+                continue
+            if arg == "--from" and i + 1 < len(args):
+                since = parse_datetime_value(args[i + 1], tz_offset_min)
+                i += 2
+                continue
+            if arg == "--to" and i + 1 < len(args):
+                until = parse_datetime_value(args[i + 1], tz_offset_min)
+                i += 2
+                continue
+            if arg == "--tz" and i + 1 < len(args):
+                tz_offset_min = int(args[i + 1])
+                i += 2
+                continue
+            i += 1
+        if not log_path.exists():
+            print(f"Trade log not found: {log_path}")
+            return
+        print_trade_stats(log_path, since, until, tz_offset_min)
+        return
+
     config_path = Path(sys.argv[1]) if len(sys.argv) > 1 else Path("config.json")
     try:
         config = load_config(config_path)
@@ -1714,7 +2173,10 @@ def main():
         print(f"Failed to load config: {exc}")
         sys.exit(1)
 
-    wallets = normalize_wallets(config)
+    wallet_aliases = config.get("wallet_aliases") or {}
+    if not isinstance(wallet_aliases, dict):
+        wallet_aliases = {}
+    wallets = normalize_wallets(config, wallet_aliases)
     missing = [k for k in ("rpc_http", "rpc_ws") if k not in config]
     if missing or not wallets:
         missing_keys = missing[:]
