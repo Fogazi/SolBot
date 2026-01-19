@@ -1,1 +1,4 @@
 .env
+price_watch.json
+trade_log.jsonl
+trade_control.json

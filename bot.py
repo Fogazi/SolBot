@@ -44,6 +44,13 @@ SELL_INFLIGHT_TIMEOUT_SEC_DEFAULT = 60
 SELL_CONFIRM_DELAY_SEC_DEFAULT = 5
 SELL_CONFIRM_MAX_ATTEMPTS_DEFAULT = 3
 AUTO_SELL_ENABLED_DEFAULT = False
+PAPER_TRADING_DEFAULT = False
+BUY_HOLD_SEC_DEFAULT = 0
+BUY_HOLD_STOP_LOSS_PCT_DEFAULT = Decimal("0")
+RATCHET_LEVELS_DEFAULT = []
+RPC_HTTP_ENV_DEFAULT = "RPC_HTTP"
+RPC_WS_ENV_DEFAULT = "RPC_WS"
+RPC_HTTP_BACKFILL_ENV_DEFAULT = "RPC_HTTP_BACKFILL"
 ENV_PATH_DEFAULT = ".env"
 KEYPAIR_ENV_DEFAULT = "SOLANA_KEYPAIR"
 PRICE_WATCH_PATH_DEFAULT = "price_watch.json"
@@ -608,6 +615,47 @@ def load_config(path: Path) -> dict:
         return json.load(f)
 
 
+def resolve_config_env_value(
+    config: dict, key: str, env_key: str, env_default: str
+):
+    value = config.get(key) if isinstance(config, dict) else None
+    if isinstance(value, str):
+        value = value.strip()
+    if value:
+        return value
+    env_name = (
+        config.get(env_key, env_default) if isinstance(config, dict) else env_default
+    )
+    if not env_name:
+        return None
+    env_value = os.getenv(env_name)
+    if isinstance(env_value, str):
+        env_value = env_value.strip()
+    return env_value or None
+
+
+def resolve_rpc_http(config: dict, override: str | None = None):
+    if override:
+        return override
+    backfill = resolve_config_env_value(
+        config,
+        "rpc_http_backfill",
+        "rpc_http_backfill_env",
+        RPC_HTTP_BACKFILL_ENV_DEFAULT,
+    )
+    if backfill:
+        return backfill
+    return resolve_config_env_value(
+        config, "rpc_http", "rpc_http_env", RPC_HTTP_ENV_DEFAULT
+    )
+
+
+def resolve_rpc_ws(config: dict):
+    return resolve_config_env_value(
+        config, "rpc_ws", "rpc_ws_env", RPC_WS_ENV_DEFAULT
+    )
+
+
 def key_str(key) -> str:
     if isinstance(key, str):
         return key
@@ -701,6 +749,30 @@ def format_percent(value: Decimal) -> str:
     return f"{value.quantize(Decimal('0.01'), rounding=ROUND_HALF_UP):f}"
 
 
+def parse_ratchet_levels(values):
+    if not values:
+        return []
+    if not isinstance(values, (list, tuple)):
+        return []
+    levels = []
+    for item in values:
+        trigger = None
+        stop = None
+        if isinstance(item, dict):
+            trigger = parse_decimal(item.get("trigger"))
+            stop = parse_decimal(item.get("stop"))
+        elif isinstance(item, (list, tuple)) and len(item) == 2:
+            trigger = parse_decimal(item[0])
+            stop = parse_decimal(item[1])
+        if trigger is None or stop is None:
+            continue
+        if trigger <= 0 or stop < 0:
+            continue
+        levels.append((trigger / Decimal(100), stop / Decimal(100)))
+    levels.sort(key=lambda item: item[0])
+    return levels
+
+
 def stop_loss_reason_for_level(level_ratio: Decimal) -> str:
     return f"STOP_LOSS_{format_percent(level_ratio * Decimal(100))}"
 
@@ -731,6 +803,17 @@ def serialize_price_watch(price_watch: dict) -> dict:
                 "wallet": wallet,
                 "mint": mint,
                 "buy_price": str(buy_price),
+                "buy_ts": entry.get("buy_ts"),
+                "ratchet_trigger": (
+                    str(entry.get("ratchet_trigger"))
+                    if entry.get("ratchet_trigger") is not None
+                    else None
+                ),
+                "ratchet_stop": (
+                    str(entry.get("ratchet_stop"))
+                    if entry.get("ratchet_stop") is not None
+                    else None
+                ),
                 "trailing_active": bool(entry.get("trailing_active", False)),
                 "trailing_peak": (
                     str(entry.get("trailing_peak"))
@@ -782,11 +865,21 @@ def load_price_watch(path: Path, wallets: set[str]) -> dict:
             continue
         if wallets and wallet not in wallets:
             continue
+        buy_ts_raw = entry.get("buy_ts")
+        buy_ts = None
+        if buy_ts_raw is not None:
+            try:
+                buy_ts = int(float(buy_ts_raw))
+            except (TypeError, ValueError):
+                buy_ts = None
         buy_price = parse_decimal(entry.get("buy_price"))
         if buy_price is None or buy_price <= 0:
             continue
         price_watch[(wallet, mint)] = {
             "buy_price": buy_price,
+            "buy_ts": buy_ts,
+            "ratchet_trigger": parse_decimal(entry.get("ratchet_trigger")),
+            "ratchet_stop": parse_decimal(entry.get("ratchet_stop")),
             "trailing_active": bool(entry.get("trailing_active", False)),
             "trailing_peak": parse_decimal(entry.get("trailing_peak")),
             "trailing_below_since": entry.get("trailing_below_since"),
@@ -1828,6 +1921,10 @@ async def run_price_alerts(
     trailing_drawdown_pct: Decimal,
     trailing_status_sec: int,
     auto_sell_enabled: bool,
+    paper_trading: bool,
+    buy_hold_sec: int,
+    buy_hold_stop_loss_ratio: Decimal,
+    ratchet_levels: list[tuple[Decimal, Decimal]],
     take_profit_pct: Decimal,
     stop_loss_levels: list[Decimal],
     drawdown_status_pct: Decimal,
@@ -1930,7 +2027,11 @@ async def run_price_alerts(
                         state = "enabled" if enabled else "disabled"
                         print(f"[CONTROL] {ts_str} | wallet {wallet} | trading {state}")
                 last_effective_trading = effective_trading
-            if trade_log_path and price_watch_sync_sec > 0:
+            if (
+                trade_log_path
+                and price_watch_sync_sec > 0
+                and not paper_trading
+            ):
                 now = time.monotonic()
                 if now - last_watch_sync >= price_watch_sync_sec:
                     last_watch_sync = now
@@ -1948,21 +2049,24 @@ async def run_price_alerts(
                 watch_snapshot = {
                     key: {
                         "buy_price": entry.get("buy_price"),
-                    "trailing_active": entry.get("trailing_active", False),
-                    "trailing_peak": entry.get("trailing_peak"),
-                    "trailing_below_since": entry.get("trailing_below_since"),
-                    "trailing_confirmed": entry.get("trailing_confirmed", False),
-                    "name": entry.get("name"),
-                    "symbol": entry.get("symbol"),
-                    "marketcap": entry.get("marketcap"),
-                    "buy_sol_used": entry.get("buy_sol_used"),
-                    "sell_inflight": entry.get("sell_inflight", False),
-                    "sell_last_attempt": entry.get("sell_last_attempt", 0),
-                    "sell_last_reason": entry.get("sell_last_reason"),
-                    "sell_skip_reason": entry.get("sell_skip_reason"),
-                    "sell_confirm_due": entry.get("sell_confirm_due"),
-                    "sell_confirm_attempts": entry.get("sell_confirm_attempts", 0),
-                    "sell_skip_logged_at": entry.get("sell_skip_logged_at", 0),
+                        "buy_ts": entry.get("buy_ts"),
+                        "ratchet_trigger": entry.get("ratchet_trigger"),
+                        "ratchet_stop": entry.get("ratchet_stop"),
+                        "trailing_active": entry.get("trailing_active", False),
+                        "trailing_peak": entry.get("trailing_peak"),
+                        "trailing_below_since": entry.get("trailing_below_since"),
+                        "trailing_confirmed": entry.get("trailing_confirmed", False),
+                        "name": entry.get("name"),
+                        "symbol": entry.get("symbol"),
+                        "marketcap": entry.get("marketcap"),
+                        "buy_sol_used": entry.get("buy_sol_used"),
+                        "sell_inflight": entry.get("sell_inflight", False),
+                        "sell_last_attempt": entry.get("sell_last_attempt", 0),
+                        "sell_last_reason": entry.get("sell_last_reason"),
+                        "sell_skip_reason": entry.get("sell_skip_reason"),
+                        "sell_confirm_due": entry.get("sell_confirm_due"),
+                        "sell_confirm_attempts": entry.get("sell_confirm_attempts", 0),
+                        "sell_skip_logged_at": entry.get("sell_skip_logged_at", 0),
                     }
                     for key, entry in price_watch.items()
                 }
@@ -2054,7 +2158,8 @@ async def run_price_alerts(
             status_now = time.monotonic()
             sell_candidates = []
             trailing_enabled = trailing_start_pct > 0 and trailing_drawdown_pct > 0
-            sell_enabled = auto_sell_enabled and sell_ratio > 0
+            sell_enabled = (auto_sell_enabled or paper_trading) and sell_ratio > 0
+            now_ts = time.time()
             for (wallet, mint), entry in watch_snapshot.items():
                 price = prices.get(mint)
                 if price is None:
@@ -2063,9 +2168,67 @@ async def run_price_alerts(
                 if buy_price is None or buy_price <= 0:
                     continue
                 change = (price - buy_price) / buy_price
+                buy_ts = entry.get("buy_ts")
+                hold_active = (
+                    buy_hold_sec > 0
+                    and buy_ts
+                    and now_ts - buy_ts < buy_hold_sec
+                )
+                hold_stop_hit = (
+                    hold_active
+                    and buy_hold_stop_loss_ratio is not None
+                    and buy_hold_stop_loss_ratio > 0
+                    and change <= -buy_hold_stop_loss_ratio
+                )
+                if hold_active and not hold_stop_hit:
+                    continue
                 key = (wallet, mint)
                 trailing_active = bool(entry.get("trailing_active", False))
                 trailing_peak = entry.get("trailing_peak")
+                ratchet_trigger = entry.get("ratchet_trigger")
+                ratchet_stop = entry.get("ratchet_stop")
+                new_ratchet_trigger = None
+                new_ratchet_stop = None
+                if ratchet_levels:
+                    for trigger, stop in ratchet_levels:
+                        if change >= trigger:
+                            new_ratchet_trigger = trigger
+                            new_ratchet_stop = stop
+                        else:
+                            break
+                if (
+                    new_ratchet_trigger is not None
+                    and (
+                        ratchet_trigger is None
+                        or new_ratchet_trigger > ratchet_trigger
+                    )
+                ):
+                    ratchet_trigger = new_ratchet_trigger
+                    ratchet_stop = new_ratchet_stop
+                    pending_updates.setdefault(
+                        key, {"buy_price": buy_price, "changes": {}}
+                    )["changes"].update(
+                        {
+                            "ratchet_trigger": ratchet_trigger,
+                            "ratchet_stop": ratchet_stop,
+                        }
+                    )
+                    symbol = entry.get("symbol") or entry.get("name") or mint
+                    trigger_pct = (
+                        ratchet_trigger * Decimal(100)
+                    ).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
+                    stop_pct = (
+                        ratchet_stop * Decimal(100)
+                    ).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
+                    ts_str = format_ts(time.time(), tz_offset_min)
+                    print(
+                        f"[RATCHET] {ts_str} | {symbol} | "
+                        f"armed at {trigger_pct:+f}% | "
+                        f"stop {stop_pct:+f}%"
+                    )
+                ratchet_hit = (
+                    ratchet_stop is not None and change <= ratchet_stop
+                )
 
                 trailing_stop_hit = False
                 if trailing_enabled:
@@ -2108,7 +2271,9 @@ async def run_price_alerts(
                                 key, {"buy_price": buy_price, "changes": {}}
                             )["changes"]["trailing_peak"] = price
 
-                        stop_price = trailing_peak * (Decimal(1) - trailing_drawdown_pct)
+                        peak_change = (trailing_peak - buy_price) / buy_price
+                        stop_change = peak_change - trailing_drawdown_pct
+                        stop_price = buy_price * (Decimal(1) + stop_change)
                         below_since = entry.get("trailing_below_since")
                         confirmed = bool(entry.get("trailing_confirmed", False))
                         if price <= stop_price:
@@ -2184,10 +2349,9 @@ async def run_price_alerts(
                     if status_now - last_ts >= trailing_status_sec:
                         symbol = entry.get("symbol") or entry.get("name") or mint
                         effective_peak = trailing_peak or price
-                        stop_price = effective_peak * (
-                            Decimal(1) - trailing_drawdown_pct
-                        )
-                        stop_gain = (stop_price - buy_price) / buy_price
+                        peak_change = (effective_peak - buy_price) / buy_price
+                        stop_gain = peak_change - trailing_drawdown_pct
+                        stop_price = buy_price * (Decimal(1) + stop_gain)
                         base_mcap = entry.get("marketcap")
                         stop_mcap = None
                         current_mcap = None
@@ -2221,7 +2385,15 @@ async def run_price_alerts(
                         last_drawdown_status.pop(key, None)
 
                 sell_reason = None
-                if trailing_enabled and trailing_stop_hit:
+                if hold_stop_hit:
+                    sell_reason = stop_loss_reason_for_level(
+                        buy_hold_stop_loss_ratio
+                    )
+                elif ratchet_hit:
+                    sell_reason = (
+                        f"RATCHET_{format_percent(ratchet_stop * Decimal(100))}"
+                    )
+                elif trailing_enabled and trailing_stop_hit:
                     sell_reason = "TRAILING_TP"
                 else:
                     stop_loss_level = None
@@ -2255,6 +2427,9 @@ async def run_price_alerts(
                     is_stop_loss = bool(
                         sell_reason and sell_reason.startswith("STOP_LOSS_")
                     )
+                    is_stop_loss = is_stop_loss or bool(
+                        sell_reason and sell_reason.startswith("RATCHET_")
+                    )
                     cooldown_ok = (
                         sell_retry_sec <= 0
                         or status_now - last_attempt >= sell_retry_sec
@@ -2275,10 +2450,11 @@ async def run_price_alerts(
                         )["changes"]["sell_inflight"] = False
                         sell_inflight = False
 
-                    if wallet not in trading_enabled_wallets:
-                        skip_reason = "trading_disabled"
-                    elif wallet not in keypairs:
-                        skip_reason = "missing_keypair"
+                    if not paper_trading:
+                        if wallet not in trading_enabled_wallets:
+                            skip_reason = "trading_disabled"
+                        elif wallet not in keypairs:
+                            skip_reason = "missing_keypair"
                     elif sell_inflight:
                         skip_reason = "sell_inflight"
                     elif not cooldown_ok:
@@ -2318,6 +2494,8 @@ async def run_price_alerts(
                                 "mint": mint,
                                 "symbol": symbol,
                                 "change": change,
+                                "price": price,
+                                "buy_price": buy_price,
                                 "reason": sell_reason,
                             }
                         )
@@ -2342,7 +2520,7 @@ async def run_price_alerts(
                         entry["last_price"] = price
                         entry["last_price_ts"] = time.time()
 
-            if sell_candidates:
+            if sell_candidates and auto_sell_enabled:
                 async with price_lock:
                     for candidate in sell_candidates:
                         key = (candidate["wallet"], candidate["mint"])
@@ -2422,6 +2600,111 @@ async def run_price_alerts(
                     )
                     print(f"[LOSS] {ts_str} | {update['symbol']} | {change_pct:+f}%")
 
+            if paper_trading and sell_candidates:
+                ts_str = format_ts(time.time(), tz_offset_min)
+                removed = 0
+                async with price_lock:
+                    for candidate in sell_candidates:
+                        key = (candidate["wallet"], candidate["mint"])
+                        entry = price_watch.get(key)
+                        if not entry:
+                            continue
+                        buy_price = entry.get("buy_price")
+                        sell_price = candidate.get("price")
+                        buy_sol_used = entry.get("buy_sol_used")
+                        pnl_pct = None
+                        sol_received = None
+                        if (
+                            buy_price is not None
+                            and buy_price > 0
+                            and sell_price is not None
+                        ):
+                            pnl_pct = (
+                                (sell_price - buy_price) / buy_price
+                            ) * Decimal(100)
+                            if buy_sol_used is not None:
+                                sol_received = (
+                                    buy_sol_used * (sell_price / buy_price)
+                                )
+                        change_pct = (candidate["change"] * Decimal(100)).quantize(
+                            Decimal("0.01"), rounding=ROUND_HALF_UP
+                        )
+                        reason = candidate.get("reason")
+                        if reason == "TRAILING_TP":
+                            reason_label = (
+                                f"trail {trailing_start_threshold}%/"
+                                f"{trailing_drawdown_threshold}%"
+                            )
+                        elif reason and reason.startswith("RATCHET_"):
+                            reason_label = f"ratchet {reason[len('RATCHET_'):] }%"
+                        elif reason and reason.startswith("STOP_LOSS_"):
+                            reason_label = f"sl -{reason[len('STOP_LOSS_'):]}%"
+                        else:
+                            reason_label = f"tp {take_profit_threshold}%"
+                        print("")
+                        print(
+                            f"[SELL] {ts_str} | {candidate['symbol']} | "
+                            f"{reason_label} | {change_pct:+f}% | paper"
+                        )
+                        if trade_log_path:
+                            entry_log = {
+                                "ts": int(time.time()),
+                                "detected_ts": int(time.time()),
+                                "signature": None,
+                                "slot": None,
+                                "wallet": candidate["wallet"],
+                                "side": "SELL",
+                                "mint": candidate["mint"],
+                                "name": entry.get("name"),
+                                "symbol": entry.get("symbol"),
+                                "marketcap": (
+                                    str(entry.get("marketcap"))
+                                    if entry.get("marketcap") is not None
+                                    else None
+                                ),
+                                "amount_raw": None,
+                                "decimals": None,
+                                "amount_ui": None,
+                                "sol_change": (
+                                    str(sol_received)
+                                    if sol_received is not None
+                                    else None
+                                ),
+                                "sol_used": None,
+                                "sol_received": (
+                                    str(sol_received)
+                                    if sol_received is not None
+                                    else None
+                                ),
+                                "buy_sol_used": (
+                                    str(buy_sol_used)
+                                    if buy_sol_used is not None
+                                    else None
+                                ),
+                                "sol_balance": None,
+                                "buy_price": (
+                                    str(buy_price)
+                                    if buy_price is not None
+                                    else None
+                                ),
+                                "sell_price": (
+                                    str(sell_price)
+                                    if sell_price is not None
+                                    else None
+                                ),
+                                "pnl_pct": (
+                                    str(pnl_pct)
+                                    if pnl_pct is not None
+                                    else None
+                                ),
+                                "paper": True,
+                            }
+                            append_trade_log(trade_log_path, entry_log)
+                        price_watch.pop(key, None)
+                        removed += 1
+                    if removed:
+                        save_price_watch(price_watch_path, price_watch)
+
             if sell_candidates and swap_client and rpc and keypairs:
                 for candidate in sell_candidates:
                     ts_str = format_ts(time.time(), tz_offset_min)
@@ -2434,6 +2717,8 @@ async def run_price_alerts(
                             f"trail {trailing_start_threshold}%/"
                             f"{trailing_drawdown_threshold}%"
                         )
+                    elif reason and reason.startswith("RATCHET_"):
+                        reason_label = f"ratchet {reason[len('RATCHET_'):] }%"
                     elif reason and reason.startswith("STOP_LOSS_"):
                         reason_label = f"sl -{reason[len('STOP_LOSS_'):]}%"
                     else:
@@ -2571,7 +2856,13 @@ async def listen_for_trades(config: dict):
     for wallet, enabled in wallet_trading_enabled.items():
         if wallet in trading_enabled_wallets and not bool(enabled):
             trading_enabled_wallets.discard(wallet)
-    ws_url = config["rpc_ws"]
+    env_path = Path(config.get("env_path", ENV_PATH_DEFAULT))
+    load_env_file(env_path)
+    rpc_http = resolve_rpc_http(config)
+    rpc_ws = resolve_rpc_ws(config)
+    if not rpc_http or not rpc_ws:
+        raise RuntimeError("Missing rpc_http or rpc_ws")
+    ws_url = rpc_ws
     commitment = resolve_commitment(config.get("commitment"))
     ws_ping_interval = int(
         config.get("ws_ping_interval", WS_PING_INTERVAL_DEFAULT)
@@ -2607,6 +2898,16 @@ async def listen_for_trades(config: dict):
     )
     auto_sell_enabled = bool(
         config.get("auto_sell_enabled", AUTO_SELL_ENABLED_DEFAULT)
+    )
+    paper_trading = bool(
+        config.get("paper_trading", PAPER_TRADING_DEFAULT)
+    )
+    buy_hold_sec = int(config.get("buy_hold_sec", BUY_HOLD_SEC_DEFAULT))
+    buy_hold_stop_loss_pct = parse_decimal(
+        config.get("buy_hold_stop_loss_pct", BUY_HOLD_STOP_LOSS_PCT_DEFAULT)
+    )
+    ratchet_levels = parse_ratchet_levels(
+        config.get("ratchet_levels", RATCHET_LEVELS_DEFAULT)
     )
     take_profit_pct = parse_decimal(
         config.get("take_profit_pct", TAKE_PROFIT_PCT_DEFAULT)
@@ -2645,8 +2946,6 @@ async def listen_for_trades(config: dict):
     price_watch_sync_sec = int(
         config.get("price_watch_sync_sec", PRICE_WATCH_SYNC_SEC_DEFAULT)
     )
-    env_path = Path(config.get("env_path", ENV_PATH_DEFAULT))
-    load_env_file(env_path)
     keypair_env = config.get("keypair_env", KEYPAIR_ENV_DEFAULT)
     keypair_path = config.get("keypair_path")
     keypair_envs = resolve_alias_dict_keys(
@@ -2689,11 +2988,17 @@ async def listen_for_trades(config: dict):
     if trailing_start_ratio <= 0 or trailing_drawdown_ratio <= 0:
         trailing_start_ratio = Decimal(0)
         trailing_drawdown_ratio = Decimal(0)
+    if buy_hold_stop_loss_pct is None or buy_hold_stop_loss_pct < 0:
+        buy_hold_stop_loss_pct = Decimal(0)
+    buy_hold_stop_loss_ratio = buy_hold_stop_loss_pct / Decimal(100)
     if sell_ratio <= 0 or (
         trailing_start_ratio <= 0
         and take_profit_ratio <= 0
         and not stop_loss_ratios
     ):
+        auto_sell_enabled = False
+    if paper_trading and auto_sell_enabled:
+        print("paper trading enabled: live auto-sell disabled")
         auto_sell_enabled = False
     headers = config.get("jupiter_headers") or {}
     if not isinstance(headers, dict):
@@ -2702,7 +3007,7 @@ async def listen_for_trades(config: dict):
     if env_api_key and not headers.get("x-api-key"):
         headers["x-api-key"] = env_api_key
 
-    rpc = RpcClient(config["rpc_http"])
+    rpc = RpcClient(rpc_http)
     token_cache = JupiterTokenCache(token_list_url, refresh_sec, headers)
     price_client = JupiterPriceClient(
         price_url, headers, batch_size=price_batch_size
@@ -2734,11 +3039,12 @@ async def listen_for_trades(config: dict):
         positions_live = {
             key: slot.get("buys") for key, slot in positions_live.items()
         }
-        removed = sync_price_watch_with_log_entries(
-            price_watch, entries, price_watch_path
-        )
-        if removed:
-            print(f"price watch cleaned: {removed} stale entries removed")
+        if not paper_trading:
+            removed = sync_price_watch_with_log_entries(
+                price_watch, entries, price_watch_path
+            )
+            if removed:
+                print(f"price watch cleaned: {removed} stale entries removed")
 
     if price_watch:
         print(f"loaded {len(price_watch)} price watch entries")
@@ -2765,6 +3071,10 @@ async def listen_for_trades(config: dict):
                 trailing_drawdown_ratio,
                 trailing_status_sec,
                 auto_sell_enabled,
+                paper_trading,
+                buy_hold_sec,
+                buy_hold_stop_loss_ratio,
+                ratchet_levels,
                 take_profit_ratio,
                 stop_loss_ratios,
                 drawdown_status_pct,
@@ -2866,6 +3176,22 @@ async def listen_for_trades(config: dict):
                             trade["symbol"] = meta.get("symbol")
                             trade["marketcap"] = meta.get("mcap")
 
+                    if paper_trading:
+                        filtered = []
+                        for summary in summaries:
+                            trades = [
+                                trade
+                                for trade in summary["trades"]
+                                if trade.get("side") != "SELL"
+                            ]
+                            if not trades:
+                                continue
+                            summary["trades"] = trades
+                            filtered.append(summary)
+                        summaries = filtered
+                        if not summaries:
+                            return
+
                     sell_keys = []
                     sell_pnls = {}
                     sell_sol_received = {}
@@ -2936,6 +3262,9 @@ async def listen_for_trades(config: dict):
                                         continue
                                     price_watch[(wallet, mint)] = {
                                         "buy_price": price,
+                                        "buy_ts": int(time.time()),
+                                        "ratchet_trigger": None,
+                                        "ratchet_stop": None,
                                         "trailing_active": False,
                                         "trailing_peak": None,
                                         "buy_sol_used": trade.get("sol_used"),
@@ -3180,7 +3509,13 @@ def main():
         if not isinstance(wallet_aliases, dict):
             wallet_aliases = {}
         wallet = wallet_aliases.get(wallet_arg, wallet_arg)
-        rpc_http = rpc_override or config.get("rpc_http_backfill") or config.get("rpc_http")
+        env_path = Path(
+            config.get("env_path", ENV_PATH_DEFAULT)
+            if isinstance(config, dict)
+            else ENV_PATH_DEFAULT
+        )
+        load_env_file(env_path)
+        rpc_http = resolve_rpc_http(config, rpc_override)
         commitment = resolve_commitment(config.get("commitment"))
         log_path = Path(
             config.get("trade_log_path", TRADE_LOG_PATH_DEFAULT)
@@ -3203,7 +3538,7 @@ def main():
             else TZ_OFFSET_MINUTES_DEFAULT
         )
         if not rpc_http:
-            print("Missing rpc_http in config.")
+            print("Missing rpc_http (config or env).")
             return
         if not log_path.exists():
             print(f"Trade log not found: {log_path}")
@@ -3334,7 +3669,9 @@ def main():
         if not isinstance(wallet_aliases, dict):
             wallet_aliases = {}
         wallet = wallet_aliases.get(wallet_arg, wallet_arg)
-        rpc_http = rpc_override or config.get("rpc_http_backfill") or config.get("rpc_http")
+        env_path = Path(config.get("env_path", ENV_PATH_DEFAULT))
+        load_env_file(env_path)
+        rpc_http = resolve_rpc_http(config, rpc_override)
         commitment = resolve_commitment(config.get("commitment"))
         log_path = Path(
             config.get("trade_log_path", TRADE_LOG_PATH_DEFAULT)
@@ -3352,16 +3689,14 @@ def main():
             if isinstance(config, dict)
             else PRICE_BATCH_SIZE_DEFAULT
         )
-        env_path = Path(config.get("env_path", ENV_PATH_DEFAULT))
         api_key_env = config.get("jupiter_api_key_env", "JUPITER_API_KEY")
         if not rpc_http:
-            print("Missing rpc_http in config.")
+            print("Missing rpc_http (config or env).")
             return
         if not log_path.exists():
             print(f"Trade log not found: {log_path}")
             return
 
-        load_env_file(env_path)
         headers = config.get("jupiter_headers") or {}
         if not isinstance(headers, dict):
             headers = {}
@@ -3434,8 +3769,19 @@ def main():
             watch = load_price_watch(watch_path, set())
             newest = max(new_entries, key=log_entry_ts)
             buy_sol_used = parse_decimal(newest.get("sol_used"))
+            buy_ts = newest.get("ts") or newest.get("detected_ts")
+            if buy_ts is None:
+                buy_ts = int(time.time())
+            else:
+                try:
+                    buy_ts = int(float(buy_ts))
+                except (TypeError, ValueError):
+                    buy_ts = int(time.time())
             watch[(wallet, mint_arg)] = {
                 "buy_price": price,
+                "buy_ts": buy_ts,
+                "ratchet_trigger": None,
+                "ratchet_stop": None,
                 "trailing_active": False,
                 "trailing_peak": None,
                 "trailing_below_since": None,
@@ -3500,7 +3846,9 @@ def main():
         if not isinstance(wallet_aliases, dict):
             wallet_aliases = {}
         wallet = wallet_aliases.get(wallet_arg, wallet_arg)
-        rpc_http = rpc_override or config.get("rpc_http_backfill") or config.get("rpc_http")
+        env_path = Path(config.get("env_path", ENV_PATH_DEFAULT))
+        load_env_file(env_path)
+        rpc_http = resolve_rpc_http(config, rpc_override)
         commitment = resolve_commitment(config.get("commitment"))
         token_list_url = config.get("jupiter_tokens_url", JUPITER_TOKENS_URL_DEFAULT)
         refresh_sec = int(config.get("jupiter_refresh_sec", JUPITER_REFRESH_SEC_DEFAULT))
@@ -3509,14 +3857,12 @@ def main():
             if isinstance(config, dict)
             else TZ_OFFSET_MINUTES_DEFAULT
         )
-        env_path = Path(config.get("env_path", ENV_PATH_DEFAULT))
         api_key_env = config.get("jupiter_api_key_env", "JUPITER_API_KEY")
 
         if not rpc_http:
-            print("Missing rpc_http in config.")
+            print("Missing rpc_http (config or env).")
             return
 
-        load_env_file(env_path)
         headers = config.get("jupiter_headers") or {}
         if not isinstance(headers, dict):
             headers = {}
@@ -3673,7 +4019,9 @@ def main():
         wallets = normalize_wallets(config, wallet_aliases)
         if wallet_arg:
             wallets = [wallet_aliases.get(wallet_arg, wallet_arg)]
-        rpc_http = rpc_override or config.get("rpc_http_backfill") or config.get("rpc_http")
+        env_path = Path(config.get("env_path", ENV_PATH_DEFAULT))
+        load_env_file(env_path)
+        rpc_http = resolve_rpc_http(config, rpc_override)
         commitment = resolve_commitment(config.get("commitment"))
         token_list_url = config.get("jupiter_tokens_url", JUPITER_TOKENS_URL_DEFAULT)
         refresh_sec = int(config.get("jupiter_refresh_sec", JUPITER_REFRESH_SEC_DEFAULT))
@@ -3693,7 +4041,6 @@ def main():
             if isinstance(config, dict)
             else PRICE_BATCH_SIZE_DEFAULT
         )
-        env_path = Path(config.get("env_path", ENV_PATH_DEFAULT))
         api_key_env = config.get("jupiter_api_key_env", "JUPITER_API_KEY")
         tz_offset_min = int(
             config.get("tz_offset_minutes", TZ_OFFSET_MINUTES_DEFAULT)
@@ -3705,13 +4052,12 @@ def main():
             print("No wallets configured.")
             return
         if not rpc_http:
-            print("Missing rpc_http in config.")
+            print("Missing rpc_http (config or env).")
             return
         if not log_path.exists():
             print(f"Trade log not found: {log_path}")
             return
 
-        load_env_file(env_path)
         headers = config.get("jupiter_headers") or {}
         if not isinstance(headers, dict):
             headers = {}
@@ -3791,9 +4137,20 @@ def main():
                     continue
                 last_buy = buys[-1]
                 buy_sol_used = parse_decimal(last_buy.get("sol_used"))
+                buy_ts = last_buy.get("ts")
+                if buy_ts is None:
+                    buy_ts = int(time.time())
+                else:
+                    try:
+                        buy_ts = int(float(buy_ts))
+                    except (TypeError, ValueError):
+                        buy_ts = int(time.time())
                 meta_slot = meta.get((wallet, mint), {})
                 watch[(wallet, mint)] = {
                     "buy_price": price,
+                    "buy_ts": buy_ts,
+                    "ratchet_trigger": None,
+                    "ratchet_stop": None,
                     "trailing_active": False,
                     "trailing_peak": None,
                     "trailing_below_since": None,
@@ -3866,7 +4223,9 @@ def main():
         wallets = normalize_wallets(config, wallet_aliases)
         if wallet_arg:
             wallets = [wallet_aliases.get(wallet_arg, wallet_arg)]
-        rpc_http = rpc_override or config.get("rpc_http_backfill") or config.get("rpc_http")
+        env_path = Path(config.get("env_path", ENV_PATH_DEFAULT))
+        load_env_file(env_path)
+        rpc_http = resolve_rpc_http(config, rpc_override)
         commitment = resolve_commitment(config.get("commitment"))
         token_list_url = config.get("jupiter_tokens_url", JUPITER_TOKENS_URL_DEFAULT)
         refresh_sec = int(config.get("jupiter_refresh_sec", JUPITER_REFRESH_SEC_DEFAULT))
@@ -3886,17 +4245,15 @@ def main():
             if isinstance(config, dict)
             else PRICE_BATCH_SIZE_DEFAULT
         )
-        env_path = Path(config.get("env_path", ENV_PATH_DEFAULT))
         api_key_env = config.get("jupiter_api_key_env", "JUPITER_API_KEY")
 
         if not wallets:
             print("No wallets configured.")
             return
         if not rpc_http:
-            print("Missing rpc_http in config.")
+            print("Missing rpc_http (config or env).")
             return
 
-        load_env_file(env_path)
         headers = config.get("jupiter_headers") or {}
         if not isinstance(headers, dict):
             headers = {}
@@ -3952,9 +4309,20 @@ def main():
                     continue
                 last_buy = buys[-1]
                 buy_sol_used = parse_decimal(last_buy.get("sol_used"))
+                buy_ts = last_buy.get("ts")
+                if buy_ts is None:
+                    buy_ts = int(time.time())
+                else:
+                    try:
+                        buy_ts = int(float(buy_ts))
+                    except (TypeError, ValueError):
+                        buy_ts = int(time.time())
                 meta_slot = meta.get((wallet, mint), {})
                 watch[(wallet, mint)] = {
                     "buy_price": price,
+                    "buy_ts": buy_ts,
+                    "ratchet_trigger": None,
+                    "ratchet_stop": None,
                     "trailing_active": False,
                     "trailing_peak": None,
                     "trailing_below_since": None,
@@ -4054,7 +4422,13 @@ def main():
                 config = load_config(config_path)
             except Exception:
                 config = {}
-        rpc_http = rpc_override or config.get("rpc_http_backfill") or config.get("rpc_http")
+        env_path = Path(
+            config.get("env_path", ENV_PATH_DEFAULT)
+            if isinstance(config, dict)
+            else ENV_PATH_DEFAULT
+        )
+        load_env_file(env_path)
+        rpc_http = resolve_rpc_http(config, rpc_override)
         commitment = resolve_commitment(config.get("commitment"))
         log_path = Path(
             config.get("trade_log_path", TRADE_LOG_PATH_DEFAULT)
@@ -4067,7 +4441,7 @@ def main():
             else TZ_OFFSET_MINUTES_DEFAULT
         )
         if not rpc_http:
-            print("Missing rpc_http in config.")
+            print("Missing rpc_http (config or env).")
             return
         if not log_path.exists():
             print(f"Trade log not found: {log_path}")
@@ -4201,18 +4575,26 @@ def main():
     if not isinstance(wallet_aliases, dict):
         wallet_aliases = {}
     wallets = normalize_wallets(config, wallet_aliases)
-    missing = [k for k in ("rpc_http", "rpc_ws") if k not in config]
+    env_path = Path(config.get("env_path", ENV_PATH_DEFAULT))
+    load_env_file(env_path)
+    rpc_http = resolve_rpc_http(config)
+    rpc_ws = resolve_rpc_ws(config)
+    missing = []
+    if not rpc_http:
+        missing.append("rpc_http")
+    if not rpc_ws:
+        missing.append("rpc_ws")
     if missing or not wallets:
         missing_keys = missing[:]
         if not wallets:
             missing_keys.append("wallet or wallets")
-        print(f"Missing config keys: {', '.join(missing_keys)}")
+        print(f"Missing config values: {', '.join(missing_keys)}")
         sys.exit(1)
 
     print("Starting wallet trade detector...")
     print(f"wallets: {', '.join(wallets)}")
-    print(f"http: {config['rpc_http']}")
-    print(f"ws: {config['rpc_ws']}")
+    print(f"http: {rpc_http}")
+    print(f"ws: {rpc_ws}")
 
     try:
         asyncio.run(listen_for_trades(config))
